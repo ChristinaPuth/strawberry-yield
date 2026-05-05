@@ -1,0 +1,8 @@
+YieldMapHarvest_Original Data/
+outputs/processed_data/*.csv
+venv/
+__pycache__/
+*.pyc
+.cache/
+.ipynb_checkpoints/
+.DS_Store
