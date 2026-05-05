@@ -932,7 +932,9 @@ def print_recommendation(advice: dict):
     print(f"  Mean/cell     : {advice['pred_yield'].mean():.4f} kg")
     print(f"\n  Days distribution:")
     for d, cnt in advice["days_distribution"].items():
-        bar = "█" * (cnt // max(advice["days_distribution"].values // 20 + 1, 1))
+        max_cnt = int(max(advice["days_distribution"].values))
+        bar_len = int(cnt) // max(max_cnt // 20 + 1, 1)
+        bar = "█" * bar_len
         marker = " ← optimal" if d == advice["optimal_days"] else ""
         print(f"    {d:2d} days: {cnt:6,} cells  {bar}{marker}")
     print("="*50 + "\n")
