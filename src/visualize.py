@@ -559,3 +559,119 @@ def plot_prediction_scatter(df_feat: pd.DataFrame,
     plt.tight_layout()
     plt.show()
     return fig
+
+
+
+# ── NEW: Ablation table heatmap ───────────────────────────────────────────────
+ 
+def plot_ablation_table(ablation_sm: pd.DataFrame,
+                         ablation_sal: pd.DataFrame,
+                         figsize=(14, 6)):
+    """
+    Side-by-side heatmap of ablation results for both sites.
+    Baselines shown separately with dashed separator.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+    fig.suptitle("Ablation Study — Val R²  (Stage 1: weight_kg prediction)",
+                 fontsize=13, fontweight='bold')
+ 
+    for ax, ablation, site in [(axes[0], ablation_sm, "SantaMaria"),
+                                (axes[1], ablation_sal, "Salinas")]:
+        # Separate baselines and ML configs
+        baselines = ablation[ablation["is_baseline"]==True].copy()
+        ml_cfgs   = ablation[ablation["is_baseline"]==False].copy()
+        ml_cfgs   = ml_cfgs.sort_values("config")
+ 
+        configs  = list(baselines["config"]) + ["—"] + list(ml_cfgs["config"])
+        r2_vals  = (list(baselines["val_r2"]) + [None] + list(ml_cfgs["val_r2"]))
+        rmse_vals= (list(baselines["val_rmse"]) + [None] + list(ml_cfgs["val_rmse"]))
+ 
+        y_pos = np.arange(len(configs))
+        colours = []
+        for i, cfg in enumerate(configs):
+            if cfg == "—":
+                colours.append("white")
+            elif cfg.startswith("B"):
+                colours.append("#CBD5E1")   # baseline: grey
+            else:
+                r2 = r2_vals[i]
+                colours.append("#2d6a3f" if r2 and r2 > 0.5 else
+                                "#E07B39" if r2 and r2 > 0.3 else
+                                "#c0392b" if r2 is not None else "white")
+ 
+        valid_r2 = [v for v in r2_vals if v is not None]
+        bars = ax.barh(y_pos, [v if v is not None else 0 for v in r2_vals],
+                       color=colours, edgecolor='white', linewidth=0.5)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(configs, fontsize=10)
+        ax.set_xlabel("Val R²", fontsize=10)
+        ax.set_title(site, fontsize=11, fontweight='bold')
+        ax.set_xlim(-0.5, 1.0)
+        ax.axvline(0, color='black', linewidth=0.8)
+ 
+        for bar, r2, rmse in zip(bars, r2_vals, rmse_vals):
+            if r2 is not None:
+                ax.text(max(bar.get_width(), 0) + 0.02, bar.get_y()+bar.get_height()/2,
+                        f"R²={r2:.3f}  RMSE={rmse:.3f}",
+                        va='center', fontsize=8)
+ 
+        # Mark best ML
+        if len(valid_r2) > 0:
+            best_r2 = max(v for v in r2_vals if v is not None)
+            best_idx = r2_vals.index(best_r2)
+            ax.get_yticklabels()[best_idx].set_fontweight('bold')
+            ax.get_yticklabels()[best_idx].set_color('#2d6a3f')
+ 
+        ax.grid(axis='x', alpha=0.3)
+        ax.invert_yaxis()
+ 
+    plt.tight_layout(); plt.show()
+    return fig
+ 
+ 
+# ── NEW: Decision Quality summary ─────────────────────────────────────────────
+ 
+def plot_dq_summary(dq_sm: pd.DataFrame,
+                     dq_sal: pd.DataFrame,
+                     figsize=(14, 5)):
+    """
+    Side-by-side Decision Quality comparison for both sites.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+    fig.suptitle("Decision Quality: Model Recommendation vs Farmer's Decision",
+                 fontsize=13, fontweight='bold')
+ 
+    for ax, dq_df, site in [(axes[0], dq_sm, "SantaMaria"),
+                             (axes[1], dq_sal, "Salinas")]:
+        valid = dq_df.dropna(subset=["DQ_kg"])
+        if valid.empty:
+            ax.text(0.5, 0.5, "No DQ data", ha='center', va='center',
+                    transform=ax.transAxes, fontsize=12)
+            ax.set_title(site); continue
+ 
+        colours = ["#2d6a3f" if v >= 0 else "#c0392b" for v in valid["DQ_kg"]]
+        ax.bar([str(d.date()) for d in valid["test_harvest_date"]],
+               valid["DQ_kg"], color=colours, edgecolor='white', linewidth=0.5)
+        ax.axhline(0, color='black', linewidth=1)
+        mean_dq = valid["DQ_kg"].mean()
+        ax.axhline(mean_dq, color='#E07B39', linewidth=2, linestyle='--',
+                   label=f"Mean DQ = {mean_dq:+,.0f} kg")
+ 
+        for i, (_, row) in enumerate(valid.iterrows()):
+            ax.text(i, row["DQ_kg"] + (valid["DQ_kg"].abs().max()*0.03 *
+                    np.sign(row["DQ_kg"])),
+                    f"{row['DQ_kg']:+,.0f}\n({row['DQ_pct']:+.1f}%)",
+                    ha='center',
+                    va='bottom' if row['DQ_kg'] >= 0 else 'top',
+                    fontsize=8)
+ 
+        ax.set_xlabel("Test harvest date")
+        ax.set_ylabel("DQ (kg)  [positive = model better]")
+        ax.set_title(f"{site}\nMean DQ = {mean_dq:+,.0f} kg  "
+                     f"({'✅ model better' if mean_dq>0 else '❌ farmer better'})",
+                     fontsize=11, fontweight='bold')
+        ax.legend(fontsize=9); ax.grid(axis='y', alpha=0.3)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha='right')
+ 
+    plt.tight_layout(); plt.show()
+    return fig
