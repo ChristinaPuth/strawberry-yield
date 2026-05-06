@@ -271,7 +271,7 @@ def plot_ground_truth_map(df_feat: pd.DataFrame,
         return
 
     # Get predictions
-    best_row = model_results['yield'].iloc[0]
+    best_row = model_results.iloc[0]
     model    = best_row['_model_obj']
     features = best_row['features']
     log_t    = best_row.get('log_target', False)
@@ -425,7 +425,7 @@ def plot_ground_truth_line(df_feat: pd.DataFrame,
     Shows: two lines + shaded gap + RMSE/MAE/R² annotation.
     """
     t_col    = 'weight_kg' if target == 'yield' else 'optimal_days'
-    best_row = model_results[target].iloc[0]
+    best_row = model_results.iloc[0]
     model    = best_row['_model_obj']
     features = best_row['features']
     log_t    = best_row.get('log_target', False) if target == 'yield' else False
@@ -510,7 +510,7 @@ def plot_prediction_scatter(df_feat: pd.DataFrame,
     Diagonal = perfect prediction line.
     """
     t_col    = 'weight_kg' if target == 'yield' else 'optimal_days'
-    best_row = model_results[target].iloc[0]
+    best_row = model_results.iloc[0]
     model    = best_row['_model_obj']
     features = best_row['features']
     log_t    = best_row.get('log_target', False) if target == 'yield' else False
