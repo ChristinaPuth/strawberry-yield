@@ -641,6 +641,7 @@ def check_features(df: pd.DataFrame, site: str):
     print(f"  {'Feature':<26} {'Non-null':>9}  {'Mean':>9}  {'Std':>9}")
     print(f"  {'-'*62}")
     for col in ALL_FEATS:
+        col = str(col)
         if col not in df.columns:
             print(f"  {col:<26} MISSING"); continue
         s = df[col].dropna()
@@ -648,11 +649,13 @@ def check_features(df: pd.DataFrame, site: str):
         print(f"  {col:<26} {len(s):>9,}  {s.mean():>9.3f}  {s.std():>9.3f}{warn}")
     print(f"\n  Baselines:")
     for col in ["seasonal_mean","trend_extrap"]:
+        col = str(col)
         if col in df.columns:
             s = df[col].dropna()
             print(f"  {col:<26} {len(s):>9,}  {s.mean():>9.3f}  {s.std():>9.3f}")
     print(f"\n  Target + Metadata:")
     for col in ["weight_kg","days_since_last"]:
+        col = str(col)
         if col in df.columns:
             s = df[col].dropna()
             print(f"  {col:<26} {len(s):>9,}  {s.mean():>9.3f}  {s.std():>9.3f}")
