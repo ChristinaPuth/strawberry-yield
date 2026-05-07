@@ -605,6 +605,12 @@ def build_features(df: pd.DataFrame,
     dsl = df.dropna(subset=["days_since_last"])["days_since_last"]
     print(f"  days_since_last  : {dsl.value_counts().sort_index().to_dict()}")
     print(f"{'='*56}\n")
+    # 删除重复列（防止merge产生 field_x.1, field_y.1）
+    # 删除重复列（防止merge产生 field_x.1, field_y.1）
+    df.columns = [str(c).split('.')[0] if str(c).endswith('.1')
+                  else c for c in df.columns]
+    df = df.loc[:, ~df.columns.duplicated()]
+   
     return df
 
 
