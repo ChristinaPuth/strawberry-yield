@@ -651,8 +651,11 @@ def build_features(df: pd.DataFrame,
 
     # Recompute rolling / trend / cumulative after potential row drop
     grp = df.groupby(["field_x","field_y"])
+    # df["rolling_mean_3"] = grp["weight_kg"].transform(
+    #     lambda x: x.shift(1).rolling(3, min_periods=1).mean())
     df["rolling_mean_3"] = grp["weight_kg"].transform(
         lambda x: x.shift(1).rolling(3, min_periods=1).mean())
+    df["rolling_mean_3"] = df["rolling_mean_3"].fillna(df["yield_lag1"])
     df["yield_trend"] = (df["yield_lag1"] - df["yield_lag3"]) / 2.0
     df["season_cumulative"] = grp["weight_kg"].transform(
         lambda x: x.shift(1).expanding().sum().fillna(0))
