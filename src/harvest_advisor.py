@@ -1655,7 +1655,7 @@ def compare_rolling_versions(df_raw: pd.DataFrame,
  
     # ── 折线图 ────────────────────────────────────────────────────────────────
     fig, axes = plt.subplots(1, 2, figsize=figsize)
-    fig.suptitle(f"{site} — Rolling Forecast: 版本A vs 版本B vs 真实值",
+    fig.suptitle(f"{site} — Rolling Forecast: VersionA vs VersionB vs Ground Truth",
                  fontsize=12, fontweight="bold")
  
     for ax, split in zip(axes, ["val", "test"]):
@@ -1669,9 +1669,9 @@ def compare_rolling_versions(df_raw: pd.DataFrame,
         ax.plot(dates, a["actual_kg"],  "o-", color="#2d5a3d",
                 linewidth=2.2, markersize=7, label="Ground Truth", zorder=4)
         ax.plot(dates, a["pred_kg"],    "s--", color="#5B8DB8",
-                linewidth=2, markersize=6, label="版本A (Lite)", zorder=3)
+                linewidth=2, markersize=6, label="VersionA (Lite)", zorder=3)
         ax.plot(b["harvest_date"], b["pred_kg"], "^:", color="#E07B39",
-                linewidth=2, markersize=6, label="版本B (Strict)", zorder=3)
+                linewidth=2, markersize=6, label="VersionB (Strict)", zorder=3)
  
         ax.fill_between(dates, a["actual_kg"], a["pred_kg"],
                         alpha=0.1, color="#5B8DB8")
