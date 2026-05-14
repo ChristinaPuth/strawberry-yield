@@ -1,5 +1,6 @@
 
 
+
 # """
 # harvest_advisor.py  v3
 # ----------------------
@@ -134,8 +135,24 @@
 #                           last_date: pd.Timestamp,
 #                           candidate_date: pd.Timestamp,
 #                           weather: pd.DataFrame,
-#                           lag_depth: int = 3) -> pd.DataFrame:
-#     """Build feature DataFrame for all grid cells for a candidate date."""
+#                           lag_depth: int = 3,
+#                           coarsen_n: int = 1) -> pd.DataFrame:
+#     """
+#     Build feature DataFrame for all grid cells for a candidate date.
+
+#     Parameters
+#     ----------
+#     coarsen_n : grid coarsening factor used during training (1 = no coarsening).
+#                 Must match the value used in fe.coarsen_grid() when building
+#                 the training features.  If > 1, df_raw is coarsened before
+#                 building lag / neighbour features so the inference grid matches
+#                 the trained model's input space.
+#     """
+#     # Coarsen if needed — must match training
+#     if coarsen_n > 1:
+#         import feature_engineering as _fe
+#         df_raw = _fe.coarsen_grid(df_raw, n=coarsen_n)
+
 #     all_dates  = sorted(df_raw["harvest_date"].unique())
 #     past_dates = [d for d in all_dates if d <= last_date]
 
@@ -268,7 +285,8 @@
 #                        last_harvest_date,
 #                        thresholds: dict,
 #                        candidate_days: list = None,
-#                        lag_depth: int = 3) -> dict:
+#                        lag_depth: int = 3,
+#                        coarsen_n: int = 1) -> dict:
 #     """
 #     Two-stage harvest recommendation.
 
@@ -278,12 +296,16 @@
 #     Parameters
 #     ----------
 #     model_results     : output of models.run_model_comparison()
-#     df_raw            : raw DataFrame from data_pipeline
+#     df_raw            : raw DataFrame from data_pipeline (always original 1x1).
+#                         Coarsening happens internally; last_actual_total is
+#                         always computed at true field scale.
 #     weather           : weather DataFrame from feature_engineering
 #     site              : 'SantaMaria' or 'Salinas'
 #     last_harvest_date : date of most recent actual harvest
 #     thresholds        : output of derive_thresholds()
 #     candidate_days    : days ahead to evaluate (default [3,4,5,6,7])
+#     coarsen_n         : grid coarsening factor used during training (1=none).
+#                         Pass 3 if model was trained on 3x3 super-cells.
 
 #     Returns
 #     -------
@@ -317,7 +339,7 @@
 #     for k in candidate_days:
 #         candidate_date = last_harvest_date + timedelta(days=k)
 #         inf_df = _build_inference_row(
-#             df_raw, last_harvest_date, candidate_date, weather, lag_depth)
+#             df_raw, last_harvest_date, candidate_date, weather, lag_depth, coarsen_n)
 #         pred   = _predict_yield(inf_df, model_results)
 
 #         pred_total   = float(pred.sum())
@@ -826,6 +848,10 @@ def _build_inference_row(df_raw: pd.DataFrame,
     pivot = pivot.merge(cum, on=["field_x","field_y"], how="left")
     pivot["season_cumulative"] = pivot["season_cumulative"].fillna(0)
     pivot["day_of_year"] = candidate_date.dayofyear
+    # days_since_last: how many days since last harvest (= the interval
+    # the model is being asked to predict for). This is what makes
+    # different candidate dates produce different predictions.
+    pivot["days_since_last"] = float((candidate_date - last_date).days)
 
     # Neighbour means from lag1
     pivot["neighbor_mean_3x3"] = _neighbor_means_from_df(pivot, "yield_lag1", 3)
