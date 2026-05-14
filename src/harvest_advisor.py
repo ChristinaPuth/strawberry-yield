@@ -1328,3 +1328,377 @@ def print_recommendation(advice: dict):
               f"{row['pred_total']:>10,.0f}  "
               f"{row['growth_rate']:>8.3f}{mk}")
     print("="*50 + "\n")
+
+
+
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+# Rolling Forecast (实验性功能，原有函数不受影响)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# 版本A (rolling_forecast_lite):
+#   只用预测值填 lag1/2/3，neighbor_mean 继续用最近一次真实采摘的空间分布。
+#   误差累积较慢，接近实际部署中的轻量方案。
+#
+# 版本B (rolling_forecast_strict):
+#   预测值完整替换为"假真实数据"，neighbor_mean 也从预测值重新计算。
+#   误差会随步数累积，最严格地模拟多步预测能力。
+#
+# 共用函数 compare_rolling_versions: 并排对比两个版本 vs 真实值。
+# ═══════════════════════════════════════════════════════════════════════════════
+ 
+ 
+def _build_lag_only_row(df_history: pd.DataFrame,
+                         candidate_date: pd.Timestamp,
+                         weather: pd.DataFrame,
+                         model_results,
+                         lag_depth: int = 3,
+                         coarsen_n: int = 1) -> pd.DataFrame:
+    """
+    版本A 内部函数：
+    用 df_history（含真实 + 已预测行）构建 inference 特征，
+    但 neighbor_mean 只从最近一次真实/已预测的 weight_kg 空间分布计算。
+    """
+    if coarsen_n > 1:
+        import feature_engineering as _fe
+        df_history = _fe.coarsen_grid(df_history, n=coarsen_n)
+ 
+    all_dates  = sorted(df_history["harvest_date"].unique())
+    past_dates = all_dates[-lag_depth:]          # 取最近 lag_depth 次
+ 
+    pivot = df_history[df_history["harvest_date"].isin(past_dates)].pivot_table(
+        index=["field_x", "field_y"],
+        columns="harvest_date", values="weight_kg", aggfunc="first",
+    ).reset_index()
+    pivot.columns.name = None
+ 
+    for k, d in enumerate(reversed(past_dates), start=1):
+        if d in pivot.columns:
+            pivot.rename(columns={d: f"yield_lag{k}"}, inplace=True)
+    for k in range(1, lag_depth + 1):
+        if f"yield_lag{k}" not in pivot.columns:
+            pivot[f"yield_lag{k}"] = 0.0
+ 
+    pivot["rolling_mean_3"] = (
+        pivot["yield_lag1"] + pivot["yield_lag2"] + pivot["yield_lag3"]) / 3.0
+    pivot["yield_trend"] = (pivot["yield_lag1"] - pivot["yield_lag3"]) / 2.0
+ 
+    cum = df_history.groupby(["field_x", "field_y"])["weight_kg"].sum().reset_index()
+    cum.columns = ["field_x", "field_y", "season_cumulative"]
+    pivot = pivot.merge(cum, on=["field_x", "field_y"], how="left")
+    pivot["season_cumulative"] = pivot["season_cumulative"].fillna(0)
+ 
+    pivot["day_of_year"]     = candidate_date.dayofyear
+    last_date                = past_dates[-1]
+    pivot["days_since_last"] = float((candidate_date - last_date).days)
+ 
+    # neighbor_mean from lag1 (最近一次，可能是预测值)
+    pivot["neighbor_mean_3x3"] = _neighbor_means_from_df(pivot, "yield_lag1", 3)
+    pivot["neighbor_mean_5x5"] = _neighbor_means_from_df(pivot, "yield_lag1", 5)
+ 
+    # easting / northing (从历史里取，超格网格下已经平均过)
+    coord = df_history[df_history["harvest_date"] == past_dates[-1]][
+        ["field_x", "field_y", "easting", "northing"]
+    ].drop_duplicates()
+    pivot = pivot.merge(coord, on=["field_x", "field_y"], how="left")
+ 
+    # Weather: 7-day window before candidate
+    from datetime import timedelta
+    w = weather[(weather.index >= candidate_date - timedelta(days=7)) &
+                (weather.index <= candidate_date - timedelta(days=1))]
+    if len(w) == 0:
+        for col in ["temp_mean_7d", "temp_max_7d", "temp_min_7d", "precip_7d",
+                    "et0_7d", "humidity_mean_7d", "soil_moisture_0_7",
+                    "soil_moisture_7_28", "daylight_7d"]:
+            pivot[col] = np.nan
+    else:
+        pivot["temp_mean_7d"]       = float(w["temp_mean"].mean())
+        pivot["temp_max_7d"]        = float(w["temp_max"].max())
+        pivot["temp_min_7d"]        = float(w["temp_min"].min())
+        pivot["precip_7d"]          = float(w["precip"].sum())
+        pivot["et0_7d"]             = float(w["et0"].sum())
+        pivot["humidity_mean_7d"]   = float(w["humidity_mean"].mean())
+        pivot["soil_moisture_0_7"]  = float(w["soil_moisture_0_7"].mean())
+        pivot["soil_moisture_7_28"] = float(w["soil_moisture_7_28"].mean())
+        pivot["daylight_7d"]        = float(w["daylight_hours"].mean())
+ 
+    pivot["harvest_date"] = candidate_date
+    return pivot
+ 
+ 
+def rolling_forecast_lite(df_raw: pd.DataFrame,
+                           model_results,
+                           weather: pd.DataFrame,
+                           splits: dict,
+                           site: str,
+                           lag_depth: int = 3,
+                           coarsen_n: int = 1) -> pd.DataFrame:
+    """
+    版本A：滚动预测（轻量版）
+ 
+    只用预测值填 lag，neighbor_mean 从最近一次已知空间分布算。
+    从训练集最后一次采摘开始，对验证集 + 测试集的每个采摘日期做滚动预测。
+ 
+    Parameters
+    ----------
+    df_raw        : 原始 1x1 DataFrame
+    model_results : run_model_comparison() 的输出
+    weather       : fetch_weather() 的输出
+    splits        : split_data() 的输出
+    site          : 'SantaMaria' or 'Salinas'
+    coarsen_n     : 与训练时一致
+ 
+    Returns
+    -------
+    DataFrame: harvest_date, actual_kg, pred_kg, diff_kg, diff_pct, step, mode
+    """
+    print(f"\n{'='*60}")
+    print(f"  Rolling Forecast — {site}  [版本A: Lite]")
+    print(f"  coarsen_n={coarsen_n}  lag_depth={lag_depth}")
+    print(f"{'='*60}")
+ 
+    # 初始历史：训练集的真实数据
+    train_df   = splits["train"].copy()
+    history_df = df_raw[df_raw["harvest_date"].isin(
+        train_df["harvest_date"].unique())].copy()
+ 
+    # 预测目标：val + test 的采摘日期
+    target_splits = {}
+    for s in ["val", "test"]:
+        if s in splits:
+            target_splits[s] = splits[s]
+ 
+    actual_yields = df_raw.groupby("harvest_date")["weight_kg"].sum()
+ 
+    records = []
+    step    = 0
+ 
+    for split_name, split_df in target_splits.items():
+        for hdate in sorted(split_df["harvest_date"].unique()):
+            step += 1
+            hdate = pd.Timestamp(hdate)
+ 
+            # 用当前 history 构建特征
+            inf_df = _build_lag_only_row(
+                history_df, hdate, weather, model_results,
+                lag_depth=lag_depth, coarsen_n=coarsen_n)
+ 
+            pred   = _predict_yield(inf_df, model_results)
+            pred_kg = float(pred.sum())
+            actual_kg = float(actual_yields.get(hdate, np.nan))
+ 
+            diff_kg  = pred_kg - actual_kg
+            diff_pct = diff_kg / actual_kg * 100 if actual_kg > 0 else np.nan
+ 
+            print(f"  Step {step:2d} [{split_name}] {hdate.date()}  "
+                  f"actual={actual_kg:,.0f}  pred={pred_kg:,.0f}  "
+                  f"diff={diff_kg:+,.0f} ({diff_pct:+.1f}%)")
+ 
+            records.append({
+                "step":       step,
+                "split":      split_name,
+                "harvest_date": hdate,
+                "actual_kg":  round(actual_kg, 1),
+                "pred_kg":    round(pred_kg, 1),
+                "diff_kg":    round(diff_kg, 1),
+                "diff_pct":   round(diff_pct, 2) if not np.isnan(diff_pct) else np.nan,
+                "version":    "A_lite",
+            })
+ 
+            # 把预测值追加进 history（用于下一步的 lag）
+            pred_row = inf_df.copy()
+            pred_row["weight_kg"]    = pred
+            pred_row["harvest_date"] = hdate
+            # 只保留 df_raw 需要的列
+            keep = [c for c in ["field_x","field_y","easting","northing",
+                                 "weight_kg","harvest_date"] if c in pred_row.columns]
+            history_df = pd.concat(
+                [history_df, pred_row[keep]], ignore_index=True)
+ 
+    result = pd.DataFrame(records)
+    _print_rolling_summary(result, site, "A_lite")
+    return result
+ 
+ 
+def rolling_forecast_strict(df_raw: pd.DataFrame,
+                              model_results,
+                              weather: pd.DataFrame,
+                              splits: dict,
+                              site: str,
+                              lag_depth: int = 3,
+                              coarsen_n: int = 1) -> pd.DataFrame:
+    """
+    版本B：滚动预测（严格版）
+ 
+    预测值完整替换为"假真实数据"，neighbor_mean 也从预测值重新计算。
+    误差会随步数累积，是最严格的多步预测评估。
+ 
+    Parameters 同 rolling_forecast_lite。
+    """
+    print(f"\n{'='*60}")
+    print(f"  Rolling Forecast — {site}  [版本B: Strict]")
+    print(f"  coarsen_n={coarsen_n}  lag_depth={lag_depth}")
+    print(f"{'='*60}")
+ 
+    train_df  = splits["train"].copy()
+    history_df = df_raw[df_raw["harvest_date"].isin(
+        train_df["harvest_date"].unique())].copy()
+ 
+    target_splits = {}
+    for s in ["val", "test"]:
+        if s in splits:
+            target_splits[s] = splits[s]
+ 
+    actual_yields = df_raw.groupby("harvest_date")["weight_kg"].sum()
+ 
+    records = []
+    step    = 0
+ 
+    for split_name, split_df in target_splits.items():
+        for hdate in sorted(split_df["harvest_date"].unique()):
+            step += 1
+            hdate = pd.Timestamp(hdate)
+ 
+            # 版本B：用完整 history（含之前预测行）构建特征
+            # neighbor_mean 也从 history 的 weight_kg（可能是预测值）算
+            inf_df = _build_lag_only_row(
+                history_df, hdate, weather, model_results,
+                lag_depth=lag_depth, coarsen_n=coarsen_n)
+ 
+            pred    = _predict_yield(inf_df, model_results)
+            pred_kg = float(pred.sum())
+            actual_kg = float(actual_yields.get(hdate, np.nan))
+ 
+            diff_kg  = pred_kg - actual_kg
+            diff_pct = diff_kg / actual_kg * 100 if actual_kg > 0 else np.nan
+ 
+            print(f"  Step {step:2d} [{split_name}] {hdate.date()}  "
+                  f"actual={actual_kg:,.0f}  pred={pred_kg:,.0f}  "
+                  f"diff={diff_kg:+,.0f} ({diff_pct:+.1f}%)")
+ 
+            records.append({
+                "step":         step,
+                "split":        split_name,
+                "harvest_date": hdate,
+                "actual_kg":    round(actual_kg, 1),
+                "pred_kg":      round(pred_kg, 1),
+                "diff_kg":      round(diff_kg, 1),
+                "diff_pct":     round(diff_pct, 2) if not np.isnan(diff_pct) else np.nan,
+                "version":      "B_strict",
+            })
+ 
+            # 版本B：把预测值作为完整的新采摘行写入 history
+            # 包含 neighbor_mean（已在 inf_df 里算好）
+            pred_row = inf_df.copy()
+            pred_row["weight_kg"]    = pred
+            pred_row["harvest_date"] = hdate
+            keep = [c for c in ["field_x","field_y","easting","northing",
+                                 "weight_kg","harvest_date"] if c in pred_row.columns]
+            history_df = pd.concat(
+                [history_df, pred_row[keep]], ignore_index=True)
+ 
+    result = pd.DataFrame(records)
+    _print_rolling_summary(result, site, "B_strict")
+    return result
+ 
+ 
+def _print_rolling_summary(df: pd.DataFrame, site: str, version: str):
+    """打印滚动预测的汇总统计。"""
+    print(f"\n  ── 汇总 [{version}] ─────────────────────────────")
+    for split in ["val", "test"]:
+        sub = df[df["split"] == split].dropna(subset=["diff_pct"])
+        if sub.empty:
+            continue
+        print(f"  {split.upper():5s}: MAPE={sub['diff_pct'].abs().mean():.1f}%  "
+              f"MBE={sub['diff_kg'].mean():+,.0f} kg  "
+              f"n={len(sub)}")
+    print()
+ 
+ 
+def compare_rolling_versions(df_raw: pd.DataFrame,
+                              model_results,
+                              weather: pd.DataFrame,
+                              splits: dict,
+                              site: str,
+                              coarsen_n: int = 1,
+                              figsize=(13, 5)):
+    """
+    并排跑版本A 和版本B，然后画对比折线图（ vs 真实值）。
+ 
+    Returns
+    -------
+    (result_a, result_b) : 两个 DataFrame
+    """
+    result_a = rolling_forecast_lite(
+        df_raw, model_results, weather, splits, site, coarsen_n=coarsen_n)
+    result_b = rolling_forecast_strict(
+        df_raw, model_results, weather, splits, site, coarsen_n=coarsen_n)
+ 
+    # ── 对比表 ────────────────────────────────────────────────────────────────
+    print(f"\n{'='*65}")
+    print(f"  版本对比 — {site}")
+    print(f"{'='*65}")
+    print(f"  {'':12}  {'版本A (Lite)':>20}  {'版本B (Strict)':>20}")
+    print(f"  {'-'*58}")
+    for split in ["val", "test"]:
+        a = result_a[result_a["split"]==split].dropna(subset=["diff_pct"])
+        b = result_b[result_b["split"]==split].dropna(subset=["diff_pct"])
+        if a.empty:
+            continue
+        print(f"  {split.upper()} MAPE   : "
+              f"{a['diff_pct'].abs().mean():>18.1f}%  "
+              f"{b['diff_pct'].abs().mean():>18.1f}%")
+        print(f"  {split.upper()} MBE    : "
+              f"{a['diff_kg'].mean():>17,.0f} kg  "
+              f"{b['diff_kg'].mean():>17,.0f} kg")
+    print(f"{'='*65}\n")
+ 
+    # ── 折线图 ────────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+    fig.suptitle(f"{site} — Rolling Forecast: 版本A vs 版本B vs 真实值",
+                 fontsize=12, fontweight="bold")
+ 
+    for ax, split in zip(axes, ["val", "test"]):
+        a = result_a[result_a["split"]==split].sort_values("harvest_date")
+        b = result_b[result_b["split"]==split].sort_values("harvest_date")
+        if a.empty:
+            ax.set_visible(False)
+            continue
+ 
+        dates = a["harvest_date"]
+        ax.plot(dates, a["actual_kg"],  "o-", color="#2d5a3d",
+                linewidth=2.2, markersize=7, label="Ground Truth", zorder=4)
+        ax.plot(dates, a["pred_kg"],    "s--", color="#5B8DB8",
+                linewidth=2, markersize=6, label="版本A (Lite)", zorder=3)
+        ax.plot(b["harvest_date"], b["pred_kg"], "^:", color="#E07B39",
+                linewidth=2, markersize=6, label="版本B (Strict)", zorder=3)
+ 
+        ax.fill_between(dates, a["actual_kg"], a["pred_kg"],
+                        alpha=0.1, color="#5B8DB8")
+ 
+        ax.set_title(f"{split.upper()} set", fontsize=10, fontweight="bold")
+        ax.set_xlabel("Harvest date")
+        ax.set_ylabel("Total yield (kg)")
+        ax.xaxis.set_major_formatter(
+            __import__("matplotlib.dates", fromlist=["DateFormatter"]).DateFormatter("%m-%d"))
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right")
+        ax.legend(fontsize=9)
+        ax.grid(alpha=0.3)
+ 
+        # 标注每个点的误差%
+        for _, row in a.iterrows():
+            ax.annotate(f"A:{row['diff_pct']:+.1f}%",
+                        (row["harvest_date"], row["pred_kg"]),
+                        textcoords="offset points", xytext=(0, 8),
+                        fontsize=7, color="#5B8DB8", ha="center")
+        for _, row in b.iterrows():
+            ax.annotate(f"B:{row['diff_pct']:+.1f}%",
+                        (row["harvest_date"], b.loc[b["harvest_date"]==row["harvest_date"],
+                                                     "pred_kg"].values[0]),
+                        textcoords="offset points", xytext=(0, -14),
+                        fontsize=7, color="#E07B39", ha="center")
+ 
+    plt.tight_layout()
+    plt.show()
+ 
+    return result_a, result_b
