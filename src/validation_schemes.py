@@ -593,3 +593,348 @@ def plot_cross_heatmap(cross_df, grid_order=None, scheme_order=None):
 
         plt.tight_layout()
         plt.show()
+
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cross-site transfer experiment
+# Add this to the END of validation_schemes.py
+# ──────────────────────────────────────────────────────────────────────────────
+
+import feature_engineering as fe
+
+
+def run_transfer_experiment(df_source, df_target,
+                             source_name, target_name,
+                             features=None,
+                             grid_shape='1x1',
+                             verbose=True):
+    """
+    Train on source site, evaluate on target site (cross-site transfer).
+
+    Uses Scheme B window structure on both sites:
+      - Source: last 60% windows → training pool
+      - Target: all windows      → test pool
+
+    All features and target normalized using source site scaler,
+    then applied to target site before prediction.
+    Predictions denormalized back to kg for evaluation.
+
+    Parameters
+    ----------
+    df_source   : feature DataFrame for training site
+    df_target   : feature DataFrame for evaluation site
+    source_name : e.g. 'SantaMaria'
+    target_name : e.g. 'Salinas'
+    features    : list of feature columns. Defaults to FEATS_14.
+    grid_shape  : label for result tracking (e.g. '7x7')
+    verbose     : print progress
+
+    Returns
+    -------
+    list of result dicts (one per target window)
+    """
+    if features is None:
+        features = FEATS_14
+
+    # ── Fix rolling_mean_3 NaN ────────────────────────────────────────────────
+    df_source = _fix_rolling_nan(df_source)
+    df_target = _fix_rolling_nan(df_target)
+
+    # ── Build source training pool (Scheme B: last 60% windows) ──────────────
+    src_dates = sorted(df_source['harvest_date'].unique())
+    n_src = len(src_dates)
+    src_windows = [(src_dates[i], src_dates[i+1], src_dates[i+2])
+                   for i in range(n_src - 2)]
+    split_idx = int(len(src_windows) * 0.6)
+    train_windows = src_windows[:split_idx]   # val windows from B
+    # Use ALL windows as training pool for transfer (more data = better)
+    train_rows = []
+    for d1, d2, d3 in src_windows:
+        train_rows.append(df_source[df_source['harvest_date'].isin([d1, d2])])
+    train_df = pd.concat(train_rows, ignore_index=True).drop_duplicates()
+
+    if verbose:
+        print(f"\n  Transfer: {source_name} → {target_name}  "
+              f"[grid={grid_shape}, features={len(features)}]")
+        print(f"  Source train rows: {len(train_df):,}  "
+              f"(from {len(src_windows)} windows, all used)")
+
+    # ── Normalize using source scaler ─────────────────────────────────────────
+    train_norm, scaler = fe.normalize_features(train_df, fit=True)
+
+    # ── Build target test windows (all sliding windows) ───────────────────────
+    tgt_dates = sorted(df_target['harvest_date'].unique())
+    n_tgt = len(tgt_dates)
+    tgt_windows = [(tgt_dates[i], tgt_dates[i+1], tgt_dates[i+2])
+                   for i in range(n_tgt - 2)]
+
+    if verbose:
+        print(f"  Target test windows: {len(tgt_windows)}")
+
+    # ── Train model on normalized source data ─────────────────────────────────
+    avail_feats = [f for f in features if f in train_norm.columns]
+    X_train = train_norm[avail_feats].fillna(0).values.astype(np.float32)
+    y_train = train_norm['weight_kg'].values   # normalized target
+
+    model = lgb.LGBMRegressor(
+        n_estimators=300, learning_rate=0.05,
+        num_leaves=63, min_child_samples=20,
+        random_state=42, verbose=-1
+    )
+    model.fit(X_train, y_train)
+
+    # ── Predict on each target window ─────────────────────────────────────────
+    all_test_rows, all_pred_rows = [], []
+
+    for d1, d2, d3 in tgt_windows:
+        # Build test set for this target window
+        test_df_win = df_target[df_target['harvest_date'] == d3].copy()
+
+        # Normalize using SOURCE scaler (cross-site transfer)
+        test_norm, _ = fe.normalize_features(
+            test_df_win, scaler=scaler, fit=False)
+
+        X_test = test_norm[avail_feats].fillna(0).values.astype(np.float32)
+        y_pred_norm = np.clip(model.predict(X_test), 0, None)
+
+        # Denormalize predictions back to kg
+        y_pred_kg = fe.denormalize_predictions(y_pred_norm, scaler)
+        y_true_kg = test_df_win['weight_kg'].values
+
+        all_test_rows.append(
+            test_df_win[['harvest_date', 'weight_kg']].assign(pred=y_pred_kg))
+
+    # ── Aggregate all target windows ──────────────────────────────────────────
+    all_test_df = pd.concat(all_test_rows, ignore_index=True)
+    y_test = all_test_df['weight_kg'].values
+    y_pred = all_test_df['pred'].values
+
+    # Cell-level metrics
+    cell_r2   = r2_score(y_test, y_pred)
+    cell_rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    cell_mae  = mean_absolute_error(y_test, y_pred)
+    nonzero   = y_test > 0
+    cell_mape = (np.abs(y_test[nonzero] - y_pred[nonzero]) /
+                 y_test[nonzero]).mean() * 100 if nonzero.sum() > 0 else np.nan
+
+    # Field-level metrics
+    field = all_test_df.groupby('harvest_date').agg(
+        actual=('weight_kg', 'sum'),
+        predicted=('pred', 'sum')
+    ).reset_index()
+    field_r2   = r2_score(field['actual'], field['predicted'])
+    field_rmse = np.sqrt(mean_squared_error(field['actual'], field['predicted']))
+    field_mape = (np.abs(field['actual'] - field['predicted']) /
+                  field['actual'].replace(0, np.nan)).mean() * 100
+
+    result = {
+        'direction':  f'{source_name}→{target_name}',
+        'source':     source_name,
+        'target':     target_name,
+        'grid':       grid_shape,
+        'n_features': len(avail_feats),
+        'n_train':    len(train_df),
+        'n_test':     len(all_test_df),
+        'cell_r2':    round(cell_r2,   4),
+        'cell_rmse':  round(cell_rmse, 4),
+        'cell_mae':   round(cell_mae,  4),
+        'cell_mape':  round(cell_mape, 2),
+        'field_r2':   round(field_r2,  4),
+        'field_rmse': round(field_rmse,2),
+        'field_mape': round(field_mape,2),
+    }
+
+    if verbose:
+        print(f"  cell_r2={cell_r2:.4f}  cell_mape={cell_mape:.1f}%  "
+              f"field_r2={field_r2:.4f}  field_mape={field_mape:.1f}%")
+
+    return result
+
+
+def run_cross_site_experiment(grid_feats,
+                               features=None,
+                               verbose=True):
+    """
+    Run bidirectional cross-site transfer for all grid shapes.
+
+    For each grid shape:
+      - SM → Sal  (train on SantaMaria, test on Salinas)
+      - Sal → SM  (train on Salinas, test on SantaMaria)
+
+    Also runs within-site B scheme for comparison baseline.
+
+    Parameters
+    ----------
+    grid_feats : dict {shape: (df_sm, df_sal)}
+    features   : feature list. Defaults to FEATS_14.
+    verbose    : print progress
+
+    Returns
+    -------
+    pd.DataFrame with transfer results + within-site baseline
+    """
+    if features is None:
+        features = FEATS_14
+
+    results = []
+
+    for grid_shape, (df_sm_g, df_sal_g) in grid_feats.items():
+        print(f"\n{'='*60}")
+        print(f"  Grid: {grid_shape}")
+        print(f"{'='*60}")
+
+        # SM → Sal
+        res = run_transfer_experiment(
+            df_sm_g, df_sal_g,
+            'SantaMaria', 'Salinas',
+            features=features,
+            grid_shape=grid_shape,
+            verbose=verbose
+        )
+        results.append(res)
+
+        # Sal → SM
+        res = run_transfer_experiment(
+            df_sal_g, df_sm_g,
+            'Salinas', 'SantaMaria',
+            features=features,
+            grid_shape=grid_shape,
+            verbose=verbose
+        )
+        results.append(res)
+
+    return pd.DataFrame(results)
+
+
+def print_transfer_summary(transfer_df, within_df=None):
+    """
+    Print cross-site transfer results alongside within-site B baseline.
+
+    Parameters
+    ----------
+    transfer_df : output of run_cross_site_experiment()
+    within_df   : output of run_cross_experiment() for within-site comparison.
+                  If provided, B scheme results are shown next to transfer results.
+    """
+    print('\n' + '='*100)
+    print('  Cross-Site Transfer Results')
+    print('='*100)
+
+    cols = ['direction', 'grid', 'cell_r2', 'cell_mape',
+            'field_r2', 'field_mape']
+    print(transfer_df[cols].to_string(index=False))
+
+    if within_df is not None:
+        # Extract B scheme test results for comparison
+        b_df = within_df[within_df['scheme'].str.contains('test')].copy()
+        b_df = b_df[b_df['scheme'].str.startswith('B')].copy()
+        b_df['scheme'] = 'B (within-site)'
+
+        print('\n' + '-'*100)
+        print('  Within-Site Baseline (Scheme B, for comparison)')
+        print('-'*100)
+        b_cols = ['site', 'grid', 'cell_r2', 'cell_mape',
+                  'field_r2', 'field_mape']
+        b_cols = [c for c in b_cols if c in b_df.columns]
+        print(b_df[b_cols].to_string(index=False))
+
+    print('='*100)
+
+
+def plot_transfer_vs_within(transfer_df, within_df,
+                             grid_order=None):
+    """
+    Bar chart comparing cross-site transfer vs within-site B for each grid.
+
+    Parameters
+    ----------
+    transfer_df : output of run_cross_site_experiment()
+    within_df   : output of run_cross_experiment()
+    grid_order  : display order of grid shapes
+    """
+    grids = grid_order or sorted(transfer_df['grid'].unique())
+
+    metrics = [
+        ('cell_r2',    'Cell R²',       True),
+        ('cell_mape',  'Cell MAPE (%)', False),
+        ('field_r2',   'Field R²',      True),
+        ('field_mape', 'Field MAPE (%)', False),
+    ]
+
+    # Within-site B results
+    b_df = within_df[within_df['scheme'].str.contains('test')].copy()
+    b_df = b_df[b_df['scheme'].str.startswith('B')].copy()
+    b_df['scheme'] = b_df['scheme'].str.replace('_test', '')
+
+    fig, axes = plt.subplots(1, len(metrics), figsize=(22, 6))
+    fig.suptitle('Cross-Site Transfer vs Within-Site (Scheme B)',
+                 fontsize=13, fontweight='bold')
+
+    colors = {
+        'SM→Sal':             '#E07B54',
+        'Sal→SM':             '#5B8DB8',
+        'B SM (within)':      '#2d6a3f',
+        'B Sal (within)':     '#8DB85B',
+    }
+
+    x = np.arange(len(grids))
+    width = 0.2
+
+    for ax, (metric, title, higher_better) in zip(axes, metrics):
+        # SM→Sal transfer
+        sm2sal = [transfer_df[
+            (transfer_df['grid']==g) &
+            (transfer_df['direction']=='SantaMaria→Salinas')
+        ][metric].values[0] if len(transfer_df[
+            (transfer_df['grid']==g) &
+            (transfer_df['direction']=='SantaMaria→Salinas')]) > 0
+        else np.nan for g in grids]
+
+        # Sal→SM transfer
+        sal2sm = [transfer_df[
+            (transfer_df['grid']==g) &
+            (transfer_df['direction']=='Salinas→SantaMaria')
+        ][metric].values[0] if len(transfer_df[
+            (transfer_df['grid']==g) &
+            (transfer_df['direction']=='Salinas→SantaMaria')]) > 0
+        else np.nan for g in grids]
+
+        # Within-site B (SantaMaria)
+        b_sm = [b_df[
+            (b_df['grid']==g) & (b_df['site']=='SantaMaria')
+        ][metric].values[0] if len(b_df[
+            (b_df['grid']==g) & (b_df['site']=='SantaMaria')]) > 0
+        else np.nan for g in grids]
+
+        # Within-site B (Salinas)
+        b_sal = [b_df[
+            (b_df['grid']==g) & (b_df['site']=='Salinas')
+        ][metric].values[0] if len(b_df[
+            (b_df['grid']==g) & (b_df['site']=='Salinas')]) > 0
+        else np.nan for g in grids]
+
+        for offset, vals, label in zip(
+            [-1.5*width, -0.5*width, 0.5*width, 1.5*width],
+            [sm2sal, sal2sm, b_sm, b_sal],
+            ['SM→Sal', 'Sal→SM', 'B SM (within)', 'B Sal (within)']
+        ):
+            bars = ax.bar(x + offset, vals, width,
+                          label=label, color=colors[label], alpha=0.85)
+            for bar, v in zip(bars, vals):
+                if not np.isnan(v):
+                    ax.text(bar.get_x() + bar.get_width()/2,
+                            bar.get_height() + 0.005,
+                            f'{v:.2f}', ha='center',
+                            fontsize=7, color=colors[label])
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(grids, fontsize=9)
+        ax.set_ylabel(title)
+        ax.set_title(title, fontweight='bold')
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    plt.show()

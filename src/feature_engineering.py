@@ -1421,3 +1421,192 @@ def check_features(df: pd.DataFrame, site: str):
             print(f"  {col:<26} {len(s):>9,}  {s.mean():>9.3f}  {s.std():>9.3f}")
     print(f"{'='*66}\n")
 
+
+
+
+
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Normalization addon for feature_engineering.py
+# Add these functions to the END of feature_engineering.py
+# Do NOT modify any existing code.
+# ──────────────────────────────────────────────────────────────────────────────
+
+import numpy as np
+import pandas as pd
+
+
+# ── Column normalization strategy ─────────────────────────────────────────────
+# 'minmax'     : (x - min) / (max - min) → [0, 1]
+# 'yield_mean' : x / mean(weight_kg)     → relative to site average yield
+
+_NORMALIZE_COLS = {
+    # Spatial coordinates
+    'field_x':            'minmax',
+    'field_y':            'minmax',
+    # Neighbor means (same unit as yield → normalize by yield mean)
+    'neighbor_mean_3x3':  'yield_mean',
+    'neighbor_mean_5x5':  'yield_mean',
+    # Calendar
+    'day_of_year':        'minmax',
+    # Yield history features
+    'yield_lag1':         'yield_mean',
+    'yield_lag2':         'yield_mean',
+    'yield_lag3':         'yield_mean',
+    'rolling_mean_3':     'yield_mean',
+    'yield_trend':        'yield_mean',
+    'season_cumulative':  'yield_mean',
+    # Weather features
+    'temp_mean_7d':       'minmax',
+    'temp_max_7d':        'minmax',
+    'temp_min_7d':        'minmax',
+    'precip_7d':          'minmax',
+    'et0_7d':             'minmax',
+    'humidity_mean_7d':   'minmax',
+    'soil_moisture_0_7':  'minmax',
+    'soil_moisture_7_28': 'minmax',
+    'daylight_7d':        'minmax',
+    # Target
+    'weight_kg':          'yield_mean',
+}
+
+
+def normalize_features(df: pd.DataFrame,
+                        scaler: dict = None,
+                        fit: bool = True,
+                        cols: dict = None) -> tuple:
+    """
+    Normalize features and target for cross-site transfer learning.
+
+    Two normalization strategies:
+      - 'minmax'     : (x - min) / (max - min)  →  [0, 1]
+      - 'yield_mean' : x / mean(weight_kg)       →  relative yield
+
+    Parameters
+    ----------
+    df     : pd.DataFrame with feature columns + weight_kg
+    scaler : dict of normalization parameters (from a previous fit).
+             If None and fit=True, parameters are computed from df.
+             If provided, those parameters are used (for test/transfer).
+    fit    : if True, compute scaler from df (use on train data).
+             if False, apply existing scaler (use on test/transfer data).
+    cols   : column strategy dict. Defaults to _NORMALIZE_COLS.
+
+    Returns
+    -------
+    df_norm : normalized DataFrame (copy, original unchanged)
+    scaler  : dict with normalization parameters for denormalization
+
+    Usage
+    -----
+    # Fit on training site (e.g. SantaMaria)
+    df_sm_norm, scaler_sm = normalize_features(df_sm, fit=True)
+
+    # Apply same scaler to target site (Salinas) for transfer
+    df_sal_norm, _ = normalize_features(df_sal, scaler=scaler_sm, fit=False)
+
+    # Apply same scaler to test split of training site
+    df_test_norm, _ = normalize_features(df_test, scaler=scaler_sm, fit=False)
+    """
+    if cols is None:
+        cols = _NORMALIZE_COLS
+
+    df_norm = df.copy()
+
+    if fit:
+        scaler = {}
+        # Compute yield mean first (needed for yield_mean columns)
+        yield_mean = df['weight_kg'].mean()
+        if yield_mean == 0 or np.isnan(yield_mean):
+            yield_mean = 1.0
+        scaler['yield_mean'] = yield_mean
+
+        for col, method in cols.items():
+            if col not in df.columns:
+                continue
+            if method == 'minmax':
+                col_min = df[col].min()
+                col_max = df[col].max()
+                col_range = col_max - col_min
+                scaler[col] = {'min': col_min, 'max': col_max,
+                               'range': col_range}
+            # yield_mean columns share the single yield_mean value
+
+    # Apply normalization
+    yield_mean = scaler['yield_mean']
+
+    for col, method in cols.items():
+        if col not in df_norm.columns:
+            continue
+        if method == 'minmax':
+            col_min   = scaler[col]['min']
+            col_range = scaler[col]['range']
+            if col_range > 0:
+                df_norm[col] = (df_norm[col] - col_min) / col_range
+            else:
+                df_norm[col] = 0.0
+        elif method == 'yield_mean':
+            df_norm[col] = df_norm[col] / yield_mean
+
+    return df_norm, scaler
+
+
+def denormalize_predictions(y_pred: np.ndarray,
+                             scaler: dict) -> np.ndarray:
+    """
+    Convert normalized predictions back to original kg scale.
+
+    Parameters
+    ----------
+    y_pred  : normalized predictions (output of model trained on normalized data)
+    scaler  : scaler dict returned by normalize_features()
+
+    Returns
+    -------
+    y_pred_kg : predictions in original kg scale
+
+    Usage
+    -----
+    y_pred_norm = model.predict(X_test_norm)
+    y_pred_kg   = denormalize_predictions(y_pred_norm, scaler_sm)
+    """
+    return y_pred * scaler['yield_mean']
+
+
+def denormalize_df(df_norm: pd.DataFrame,
+                   scaler: dict,
+                   cols: dict = None) -> pd.DataFrame:
+    """
+    Reverse normalization on a full DataFrame.
+    Useful for restoring weight_kg and feature columns to original scale
+    for reporting or visualization.
+
+    Parameters
+    ----------
+    df_norm : normalized DataFrame
+    scaler  : scaler dict returned by normalize_features()
+    cols    : column strategy dict. Defaults to _NORMALIZE_COLS.
+
+    Returns
+    -------
+    df_orig : DataFrame with original scale values (copy)
+    """
+    if cols is None:
+        cols = _NORMALIZE_COLS
+
+    df_orig = df_norm.copy()
+    yield_mean = scaler['yield_mean']
+
+    for col, method in cols.items():
+        if col not in df_orig.columns:
+            continue
+        if method == 'minmax':
+            col_min   = scaler[col]['min']
+            col_range = scaler[col]['range']
+            df_orig[col] = df_orig[col] * col_range + col_min
+        elif method == 'yield_mean':
+            df_orig[col] = df_orig[col] * yield_mean
+
+    return df_orig
