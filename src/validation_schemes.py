@@ -938,3 +938,184 @@ def plot_transfer_vs_within(transfer_df, within_df,
 
     plt.tight_layout()
     plt.show()
+
+
+def run_transfer_experiment_A1(df_source, df_target,
+                                source_name, target_name,
+                                features=None,
+                                grid_shape='1x1',
+                                test_ratio=0.4,
+                                seed=42,
+                                verbose=True):
+    """
+    Train on source site using Scheme A.1 window logic,
+    evaluate on target site (cross-site transfer).
+
+    A.1: randomly selected windows, 2-harvest train, 14 features.
+    Source: random 60% windows -> training pool.
+    Target: all windows        -> test pool.
+    All features normalized using source scaler.
+    """
+    if features is None:
+        features = FEATS_14
+
+    np.random.seed(seed)
+
+    # Fix rolling_mean_3 NaN
+    df_source = _fix_rolling_nan(df_source)
+    df_target = _fix_rolling_nan(df_target)
+
+    # ── Build source training pool (A.1: random 60% windows) ─────────────────
+    src_dates = sorted(df_source['harvest_date'].unique())
+    n_src = len(src_dates)
+    src_windows = [(src_dates[i], src_dates[i+1], src_dates[i+2])
+                   for i in range(n_src - 2)]
+
+    # Random split: 60% val (training pool), 40% test (unused for transfer)
+    n_test   = int(len(src_windows) * test_ratio)
+    test_idx = sorted(np.random.choice(len(src_windows), n_test, replace=False))
+    val_idx  = [i for i in range(len(src_windows)) if i not in test_idx]
+    train_windows = [src_windows[i] for i in val_idx]
+
+    train_rows = []
+    for d1, d2, d3 in train_windows:
+        train_rows.append(df_source[df_source['harvest_date'].isin([d1, d2])])
+    train_df = pd.concat(train_rows, ignore_index=True).drop_duplicates()
+
+    if verbose:
+        print(f"\n  Transfer A.1: {source_name} → {target_name}  "
+              f"[grid={grid_shape}, features={len(features)}]")
+        print(f"  Source train rows: {len(train_df):,}  "
+              f"(from {len(train_windows)}/{len(src_windows)} windows, "
+              f"random 60%)")
+
+    # ── Normalize using source scaler ─────────────────────────────────────────
+    train_norm, scaler = fe.normalize_features(train_df, fit=True)
+
+    # ── Build target test windows (all sliding windows) ───────────────────────
+    tgt_dates = sorted(df_target['harvest_date'].unique())
+    n_tgt = len(tgt_dates)
+    tgt_windows = [(tgt_dates[i], tgt_dates[i+1], tgt_dates[i+2])
+                   for i in range(n_tgt - 2)]
+
+    if verbose:
+        print(f"  Target test windows: {len(tgt_windows)}")
+
+    # ── Train model ───────────────────────────────────────────────────────────
+    avail_feats = [f for f in features if f in train_norm.columns]
+    X_train = train_norm[avail_feats].fillna(0).values.astype(np.float32)
+    y_train = train_norm['weight_kg'].values
+
+    model = lgb.LGBMRegressor(
+        n_estimators=300, learning_rate=0.05,
+        num_leaves=63, min_child_samples=20,
+        random_state=42, verbose=-1
+    )
+    model.fit(X_train, y_train)
+
+    # ── Predict on each target window ─────────────────────────────────────────
+    all_test_rows = []
+    for d1, d2, d3 in tgt_windows:
+        test_df_win = df_target[df_target['harvest_date'] == d3].copy()
+        test_norm, _ = fe.normalize_features(
+            test_df_win, scaler=scaler, fit=False)
+        X_test = test_norm[avail_feats].fillna(0).values.astype(np.float32)
+        y_pred_norm = np.clip(model.predict(X_test), 0, None)
+        y_pred_kg   = fe.denormalize_predictions(y_pred_norm, scaler)
+        all_test_rows.append(
+            test_df_win[['harvest_date', 'weight_kg']].assign(pred=y_pred_kg))
+
+    # ── Metrics ───────────────────────────────────────────────────────────────
+    all_test_df = pd.concat(all_test_rows, ignore_index=True)
+    y_test = all_test_df['weight_kg'].values
+    y_pred = all_test_df['pred'].values
+
+    cell_r2   = r2_score(y_test, y_pred)
+    cell_rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    cell_mae  = mean_absolute_error(y_test, y_pred)
+    nonzero   = y_test > 0
+    cell_mape = (np.abs(y_test[nonzero] - y_pred[nonzero]) /
+                 y_test[nonzero]).mean() * 100 if nonzero.sum() > 0 else np.nan
+
+    field = all_test_df.groupby('harvest_date').agg(
+        actual=('weight_kg', 'sum'),
+        predicted=('pred', 'sum')
+    ).reset_index()
+    field_r2   = r2_score(field['actual'], field['predicted'])
+    field_rmse = np.sqrt(mean_squared_error(field['actual'], field['predicted']))
+    field_mape = (np.abs(field['actual'] - field['predicted']) /
+                  field['actual'].replace(0, np.nan)).mean() * 100
+
+    result = {
+        'direction':  f'{source_name}→{target_name}',
+        'scheme':     'A.1',
+        'source':     source_name,
+        'target':     target_name,
+        'grid':       grid_shape,
+        'n_features': len(avail_feats),
+        'n_train':    len(train_df),
+        'n_test':     len(all_test_df),
+        'cell_r2':    round(cell_r2,   4),
+        'cell_rmse':  round(cell_rmse, 4),
+        'cell_mae':   round(cell_mae,  4),
+        'cell_mape':  round(cell_mape, 2),
+        'field_r2':   round(field_r2,  4),
+        'field_rmse': round(field_rmse,2),
+        'field_mape': round(field_mape,2),
+    }
+
+    if verbose:
+        print(f"  cell_r2={cell_r2:.4f}  cell_mape={cell_mape:.1f}%  "
+              f"field_r2={field_r2:.4f}  field_mape={field_mape:.1f}%")
+
+    return result
+
+
+def run_cross_site_A1(grid_feats, features=None, seed=42, verbose=True):
+    """
+    Run bidirectional A.1 cross-site transfer for all grid shapes.
+
+    Parameters
+    ----------
+    grid_feats : dict {shape: (df_sm, df_sal)}
+    features   : feature list. Defaults to FEATS_14.
+    seed       : random seed for A.1 window selection.
+    verbose    : print progress.
+
+    Returns
+    -------
+    pd.DataFrame with transfer results
+    """
+    if features is None:
+        features = FEATS_14
+
+    results = []
+
+    for grid_shape, (df_sm_g, df_sal_g) in grid_feats.items():
+        print(f"\n{'='*60}")
+        print(f"  Grid: {grid_shape}  [Scheme A.1]")
+        print(f"{'='*60}")
+
+        # SM → Sal
+        res = run_transfer_experiment_A1(
+            df_sm_g, df_sal_g,
+            'SantaMaria', 'Salinas',
+            features=features,
+            grid_shape=grid_shape,
+            seed=seed,
+            verbose=verbose
+        )
+        results.append(res)
+
+        # Sal → SM
+        res = run_transfer_experiment_A1(
+            df_sal_g, df_sm_g,
+            'Salinas', 'SantaMaria',
+            features=features,
+            grid_shape=grid_shape,
+            seed=seed,
+            verbose=verbose
+        )
+        results.append(res)
+
+    return pd.DataFrame(results)
