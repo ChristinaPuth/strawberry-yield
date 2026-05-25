@@ -68,7 +68,7 @@ def parse_folder_date(folder_name: str):
 
 
 # ── Single date loader ───────────────────────────────────────────────────────
-
+# 读取某一天的 yield CSV
 # def load_one_date(date_folder_path: str, harvest_date: datetime, site: str) -> pd.DataFrame | None:
 def load_one_date(date_folder_path: str, harvest_date: datetime, site: str):
     """
@@ -126,7 +126,7 @@ def load_one_date(date_folder_path: str, harvest_date: datetime, site: str):
 
 
 # ── Site loader ──────────────────────────────────────────────────────────────
-
+# 读取一个地块的所有日期
 def load_site(site: str, base_path: str) -> pd.DataFrame:
     """
     Load all harvest dates for a given site.
@@ -254,7 +254,72 @@ def summary(df: pd.DataFrame) -> pd.DataFrame:
         .sort_values("harvest_date")
     )
 
-
+#  ── Weather cache ────────────────────────────────────────────────────────────
+ 
+def load_weather_cached(site: str, outputs_path: str):
+    """
+    Load weather data from cache, or fetch from Open-Meteo and save.
+ 
+    Parameters
+    ----------
+    site         : 'SantaMaria' or 'Salinas'
+    outputs_path : path to outputs/processed_data folder
+ 
+    Returns
+    -------
+    pd.DataFrame with daily weather indexed by date
+    """
+    import feature_engineering as fe
+ 
+    path = os.path.join(outputs_path, f'weather_{site}.csv')
+    if os.path.exists(path):
+        print(f'Loading cached weather for {site}...')
+        return pd.read_csv(path, index_col=0, parse_dates=True)
+    print(f'Fetching weather for {site} from Open-Meteo...')
+    w = fe.fetch_weather(site)
+    w.to_csv(path)
+    print(f'  Saved to {path}')
+    return w
+ 
+ 
+# ── Feature cache ─────────────────────────────────────────────────────────────
+ 
+def load_features_cached(site: str, df_raw, weather,
+                          outputs_path: str,
+                          force_rebuild: bool = False,
+                          backfill_lags: bool = True,
+                          drop_anomaly: bool = True):
+    """
+    Load pre-built features from cache, or build and save them.
+ 
+    Parameters
+    ----------
+    site          : 'SantaMaria' or 'Salinas'
+    df_raw        : raw harvest DataFrame from load_site()
+    weather       : weather DataFrame from load_weather_cached()
+    outputs_path  : path to outputs/processed_data folder
+    force_rebuild : if True, rebuild even if cache exists
+    backfill_lags : passed to fe.build_features()
+    drop_anomaly  : passed to fe.build_features()
+ 
+    Returns
+    -------
+    pd.DataFrame with all features
+    """
+    import feature_engineering as fe
+ 
+    path = os.path.join(outputs_path, f'features_{site}_v3.csv')
+    if os.path.exists(path) and not force_rebuild:
+        print(f'Loading cached features for {site}...')
+        df = pd.read_csv(path, parse_dates=['harvest_date'])
+        return df.loc[:, ~df.columns.duplicated()]
+    print(f'Building features for {site}...')
+    df = fe.build_features(df_raw, site, weather,
+                           backfill_lags=backfill_lags,
+                           drop_anomaly=drop_anomaly)
+    df.to_csv(path, index=False)
+    print(f'  Saved to {path}')
+    return df
 # ── Hello test ───────────────────────────────────────────────────────────────
 
 def hello():

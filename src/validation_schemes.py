@@ -1119,3 +1119,330 @@ def run_cross_site_A1(grid_feats, features=None, seed=42, verbose=True):
         results.append(res)
 
     return pd.DataFrame(results)
+
+
+
+
+    # ── All-schemes transfer experiment ──────────────────────────────────────────
+ 
+def _transfer_metrics(all_test_df):
+    """Compute cell and field metrics from concatenated test rows."""
+    from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+ 
+    y_test = all_test_df['weight_kg'].values
+    y_pred = all_test_df['pred'].values
+ 
+    cell_r2   = r2_score(y_test, y_pred)
+    cell_rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    cell_mae  = mean_absolute_error(y_test, y_pred)
+    nonzero   = y_test > 0
+    cell_mape = (np.abs(y_test[nonzero] - y_pred[nonzero]) /
+                 y_test[nonzero]).mean() * 100 if nonzero.sum() > 0 else np.nan
+ 
+    field = all_test_df.groupby('harvest_date').agg(
+        actual=('weight_kg', 'sum'),
+        predicted=('pred', 'sum')
+    ).reset_index()
+    field_r2   = r2_score(field['actual'], field['predicted'])
+    field_rmse = np.sqrt(mean_squared_error(field['actual'], field['predicted']))
+    field_mape = (np.abs(field['actual'] - field['predicted']) /
+                  field['actual'].replace(0, np.nan)).mean() * 100
+ 
+    return {
+        'cell_r2':    round(cell_r2,   4),
+        'cell_rmse':  round(cell_rmse, 4),
+        'cell_mae':   round(cell_mae,  4),
+        'cell_mape':  round(cell_mape, 2),
+        'field_r2':   round(field_r2,  4),
+        'field_rmse': round(field_rmse,2),
+        'field_mape': round(field_mape,2),
+    }
+ 
+ 
+def _train_and_predict(train_norm, test_dfs, avail_feats, scaler, seed=42):
+    """Train LightGBM on normalized source data and predict on list of test DataFrames."""
+    import feature_engineering as fe
+ 
+    X_train = train_norm[avail_feats].fillna(0).values.astype(np.float32)
+    y_train = train_norm['weight_kg'].values
+ 
+    model = lgb.LGBMRegressor(
+        n_estimators=300, learning_rate=0.05,
+        num_leaves=63, min_child_samples=20,
+        random_state=seed, verbose=-1
+    )
+    model.fit(X_train, y_train)
+ 
+    all_rows = []
+    for test_df_win in test_dfs:
+        test_norm, _ = fe.normalize_features(
+            test_df_win, scaler=scaler, fit=False)
+        X_test = test_norm[avail_feats].fillna(0).values.astype(np.float32)
+        y_pred_norm = np.clip(model.predict(X_test), 0, None)
+        y_pred_kg   = fe.denormalize_predictions(y_pred_norm, scaler)
+        all_rows.append(
+            test_df_win[['harvest_date', 'weight_kg']].assign(pred=y_pred_kg))
+ 
+    return pd.concat(all_rows, ignore_index=True)
+ 
+ 
+def run_all_transfer_schemes(df_source, df_target,
+                              source_name, target_name,
+                              grid_shape, seed=42):
+    """
+    Run all transfer schemes (A.1/B/C/D/E/AllWindows) for one direction
+    and one grid shape. All use 14 features (no temporal).
+ 
+    Parameters
+    ----------
+    df_source   : feature DataFrame for training site
+    df_target   : feature DataFrame for evaluation site
+    source_name : e.g. 'SantaMaria'
+    target_name : e.g. 'Salinas'
+    grid_shape  : label for result tracking (e.g. '7x7')
+    seed        : random seed
+ 
+    Returns
+    -------
+    list of result dicts, one per scheme
+    """
+    import feature_engineering as fe
+ 
+    np.random.seed(seed)
+ 
+    df_source = _fix_rolling_nan(df_source)
+    df_target = _fix_rolling_nan(df_target)
+ 
+    src_dates = sorted(df_source['harvest_date'].unique())
+    tgt_dates = sorted(df_target['harvest_date'].unique())
+    n_src = len(src_dates)
+    n_tgt = len(tgt_dates)
+ 
+    features = FEATS_14
+ 
+    # Target test windows (predict day only)
+    tgt_windows_2 = [df_target[df_target['harvest_date'] == tgt_dates[i+2]].copy()
+                     for i in range(n_tgt - 2)]
+    tgt_windows_5 = [df_target[df_target['harvest_date'] == tgt_dates[i+5]].copy()
+                     for i in range(n_tgt - 5)]
+ 
+    # Source window date lists
+    src_win2 = [(src_dates[i], src_dates[i+1]) for i in range(n_src - 2)]
+    src_win5 = [src_dates[i:i+5] for i in range(n_src - 5)]
+ 
+    def build_train(windows_dates):
+        rows = []
+        for dates in windows_dates:
+            if isinstance(dates, tuple):
+                dates = list(dates)
+            rows.append(df_source[df_source['harvest_date'].isin(dates)])
+        return pd.concat(rows, ignore_index=True).drop_duplicates()
+ 
+    results = []
+ 
+    # Scheme indices for 2-harvest windows
+    n2 = len(src_win2)
+    n_val2 = int(n2 * 0.6)
+    n5 = len(src_win5)
+    n_val5 = int(n5 * 0.6)
+ 
+    scheme_configs = [
+        # (name, train_dates_list, tgt_windows)
+        ('A.1',        [src_win2[i] for i in
+                        sorted(np.random.choice(n2, n_val2, replace=False))
+                        if True],                          tgt_windows_2),
+        ('B',          src_win2[:n_val2],                  tgt_windows_2),
+        ('C',          src_win5[:n_val5],                  tgt_windows_5),
+        ('D',          [src_win5[i] for i in
+                        sorted(np.random.choice(n5, n_val5, replace=False))
+                        if True],                          tgt_windows_5),
+        ('E',          src_win2[int(n2*0.4):],             tgt_windows_2),
+        ('AllWindows', src_win2,                           tgt_windows_2),
+    ]
+ 
+    # Rebuild A.1 and D with proper random selection
+    np.random.seed(seed)
+    idx_a1 = sorted(np.random.choice(n2, n_val2, replace=False))
+    idx_d  = sorted(np.random.choice(n5, n_val5, replace=False))
+ 
+    scheme_configs = [
+        ('A.1',        [src_win2[i] for i in idx_a1],     tgt_windows_2),
+        ('B',          src_win2[:n_val2],                  tgt_windows_2),
+        ('C',          src_win5[:n_val5],                  tgt_windows_5),
+        ('D',          [src_win5[i] for i in idx_d],       tgt_windows_5),
+        ('E',          src_win2[int(n2*0.4):],             tgt_windows_2),
+        ('AllWindows', src_win2,                           tgt_windows_2),
+    ]
+ 
+    for scheme_name, train_dates, tgt_wins in scheme_configs:
+        train_df   = build_train(train_dates)
+        train_norm, scaler = fe.normalize_features(train_df, fit=True)
+        avail      = [f for f in features if f in train_norm.columns]
+        all_test   = _train_and_predict(train_norm, tgt_wins, avail, scaler, seed)
+ 
+        res = {
+            'scheme':    scheme_name,
+            'direction': f'{source_name}→{target_name}',
+            'grid':      grid_shape,
+            'n_train':   len(train_df),
+            'n_test':    len(all_test),
+        }
+        res.update(_transfer_metrics(all_test))
+        results.append(res)
+        print(f"  {scheme_name:12s}: cell_r2={res['cell_r2']:.4f}  "
+              f"field_r2={res['field_r2']:.4f}  "
+              f"field_mape={res['field_mape']:.1f}%")
+ 
+    return results
+ 
+ 
+def run_full_transfer_experiment(grid_feats, seed=42, verbose=True):
+    """
+    Run all transfer schemes (A.1/B/C/D/E/AllWindows) bidirectionally
+    for all grid shapes.
+ 
+    Parameters
+    ----------
+    grid_feats : dict {shape: (df_sm, df_sal)}
+    seed       : random seed
+    verbose    : print progress
+ 
+    Returns
+    -------
+    pd.DataFrame with all results
+    """
+    all_results = []
+ 
+    for grid_shape, (df_sm_g, df_sal_g) in grid_feats.items():
+        print(f"\n{'#'*60}")
+        print(f"  Grid: {grid_shape}")
+        print(f"{'#'*60}")
+ 
+        print(f"\n  SantaMaria → Salinas")
+        res = run_all_transfer_schemes(
+            df_sm_g, df_sal_g,
+            'SantaMaria', 'Salinas',
+            grid_shape=grid_shape, seed=seed,
+        )
+        all_results.extend(res)
+ 
+        print(f"\n  Salinas → SantaMaria")
+        res = run_all_transfer_schemes(
+            df_sal_g, df_sm_g,
+            'Salinas', 'SantaMaria',
+            grid_shape=grid_shape, seed=seed,
+        )
+        all_results.extend(res)
+ 
+    print("\nAll transfer experiments done!")
+    return pd.DataFrame(all_results)
+ 
+ 
+def print_full_transfer_summary(full_transfer_df, within_df=None,
+                                 grids=None):
+    """
+    Print full transfer experiment results with optional within-site baseline.
+ 
+    Parameters
+    ----------
+    full_transfer_df : output of run_full_transfer_experiment()
+    within_df        : output of run_cross_experiment() for within-site B baseline
+    grids            : list of grid shapes to show
+    """
+    if grids is None:
+        grids = sorted(full_transfer_df['grid'].unique())
+ 
+    cols = ['direction', 'scheme', 'grid',
+            'n_train', 'cell_r2', 'cell_mape',
+            'field_r2', 'field_mape']
+ 
+    print('\n' + '='*110)
+    print('  Full Cross-Site Transfer — All Schemes (A.1/B/C/D/E/AllWindows)')
+    print('='*110)
+ 
+    for grid in grids:
+        print(f"\n  Grid: {grid}")
+        sub = full_transfer_df[full_transfer_df['grid'] == grid].sort_values(
+            ['direction', 'scheme'])
+        print(sub[cols].to_string(index=False))
+ 
+    if within_df is not None:
+        print('\n' + '='*110)
+        print('  Within-Site Baseline (Scheme B, upper bound)')
+        print('='*110)
+        b = within_df[within_df['scheme'].str.contains('test')].copy()
+        b = b[b['scheme'].str.startswith('B')].copy()
+        b['scheme'] = b['scheme'].str.replace('_test', '')
+        print(b[['site', 'grid', 'cell_r2', 'cell_mape',
+                  'field_r2', 'field_mape']].to_string(index=False))
+ 
+    print('='*110)
+ 
+ 
+def plot_full_transfer(full_transfer_df, grids=None):
+    """
+    Bar chart comparing all transfer schemes for each direction.
+ 
+    Parameters
+    ----------
+    full_transfer_df : output of run_full_transfer_experiment()
+    grids            : list of grid shapes to show
+    """
+    import matplotlib.pyplot as plt
+ 
+    if grids is None:
+        grids = sorted(full_transfer_df['grid'].unique())
+ 
+    schemes_order = ['A.1', 'B', 'C', 'D', 'E', 'AllWindows']
+    directions    = ['SantaMaria→Salinas', 'Salinas→SantaMaria']
+    metrics       = [
+        ('cell_r2',    'Cell R²',        True),
+        ('cell_mape',  'Cell MAPE (%)',  False),
+        ('field_r2',   'Field R²',       True),
+        ('field_mape', 'Field MAPE (%)', False),
+    ]
+    colors = {
+        'A.1':        '#2d6a3f',
+        'B':          '#5B8DB8',
+        'C':          '#E07B54',
+        'D':          '#9B59B6',
+        'E':          '#F4D03F',
+        'AllWindows': '#E74C3C',
+    }
+ 
+    for direction in directions:
+        fig, axes = plt.subplots(1, 4, figsize=(24, 6))
+        fig.suptitle(f'Transfer: {direction}  (14 features, no temporal)',
+                     fontsize=13, fontweight='bold')
+ 
+        sub = full_transfer_df[full_transfer_df['direction'] == direction]
+        x = np.arange(len(grids))
+        width = 0.13
+ 
+        for ax, (metric, title, higher_better) in zip(axes, metrics):
+            for k, scheme in enumerate(schemes_order):
+                vals = []
+                for grid in grids:
+                    row = sub[(sub['grid'] == grid) & (sub['scheme'] == scheme)]
+                    vals.append(row[metric].values[0]
+                                if len(row) > 0 else np.nan)
+                offset = (k - len(schemes_order)/2 + 0.5) * width
+                bars = ax.bar(x + offset, vals, width,
+                              label=scheme, color=colors[scheme], alpha=0.85)
+                for bar, v in zip(bars, vals):
+                    if not np.isnan(v):
+                        ax.text(bar.get_x() + bar.get_width()/2,
+                                bar.get_height() + 0.005,
+                                f'{v:.2f}', ha='center',
+                                fontsize=6, color=colors[scheme])
+ 
+            ax.set_xticks(x)
+            ax.set_xticklabels(grids)
+            ax.set_ylabel(title)
+            ax.set_title(title, fontweight='bold')
+            ax.legend(fontsize=7)
+            ax.grid(alpha=0.3, axis='y')
+ 
+        plt.tight_layout()
+        plt.show()
+ 
