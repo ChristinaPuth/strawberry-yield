@@ -1737,3 +1737,229 @@ def plot_grid_comparison(results_df: pd.DataFrame,
                  fontsize=13, fontweight='bold')
     plt.show()
  
+
+  
+# ── Rule A vs Rule B field-level comparison ───────────────────────────────────
+ 
+def compare_rule_a_vs_b(df_raw: pd.DataFrame,
+                         model_results_7x7,
+                         weather: pd.DataFrame,
+                         df_feat_train: pd.DataFrame,
+                         site: str,
+                         scheme_b_splits: list,
+                         velocity_clip: float = 0.30,
+                         min_count: int = 2) -> pd.DataFrame:
+    """
+    Compare Rule A (original, gr_pred only) vs Rule B (Method B, with velocity)
+    on the same Scheme B test windows.
+ 
+    Rule A: derive_thresholds() + _apply_rule()
+            Decision based on gr_pred alone, no velocity.
+            Thresholds from original derive_thresholds() (no rare-interval filter).
+ 
+    Rule B: derive_thresholds_v2() + apply_rule_method_b()
+            Decision based on gr_pred + velocity (acceleration).
+            Thresholds filter intervals appearing < min_count times.
+ 
+    Parameters
+    ----------
+    df_raw          : raw DataFrame from data_pipeline (1x1)
+    model_results_7x7 : Stage 1 model trained on 7x7 grid
+    weather         : weather DataFrame
+    df_feat_train   : training split of feature DataFrame (for threshold derivation)
+    site            : site name string
+    scheme_b_splits : output of build_scheme_b_splits()
+    velocity_clip   : clip bound for Rule B velocity
+    min_count       : minimum interval occurrences for Rule B threshold filter
+ 
+    Returns
+    -------
+    DataFrame with one row per window:
+      window, last_date, test_date, actual_days,
+      pred_A, error_A, correct_A, within1_A,
+      pred_B, error_B, correct_B, within1_B,
+      gr_pred, velocity_raw, velocity_clipped
+    """
+    # Derive thresholds for both rules
+    thresh_A = derive_thresholds(df_feat_train, site)       # original (no filter)
+    thresh_B = derive_thresholds_v2(df_feat_train, site,
+                                    min_count=min_count)    # v2 (filtered)
+ 
+    actual_yields = df_raw.groupby('harvest_date')['weight_kg'].sum()
+    all_dates     = sorted(df_raw['harvest_date'].unique())
+ 
+    date_to_days = {}
+    for i in range(1, len(all_dates)):
+        gap = (pd.Timestamp(all_dates[i]) - pd.Timestamp(all_dates[i-1])).days
+        date_to_days[pd.Timestamp(all_dates[i])] = gap
+ 
+    records = []
+ 
+    for i, sp in enumerate(scheme_b_splits):
+        test_date = pd.Timestamp(sp['test_date'])
+        last_date = pd.Timestamp(sp['train_d2'])
+ 
+        actual_days = date_to_days.get(test_date)
+        if actual_days is None:
+            continue
+ 
+        past_dates = [d for d in all_dates if pd.Timestamp(d) <= last_date]
+        if len(past_dates) < 3:
+            continue
+ 
+        history_totals = [float(actual_yields.get(pd.Timestamp(d), 0))
+                          for d in past_dates[-3:]]
+ 
+        try:
+            inf_df     = _build_inference_row(
+                df_raw, last_date,
+                last_date + timedelta(days=1),
+                weather, lag_depth=3, coarsen_n=7)
+            pred_total = float(_predict_yield(inf_df, model_results_7x7).sum())
+        except Exception as e:
+            print(f"  Window {i}: Stage 1 failed -> {e}")
+            continue
+ 
+        # ── Rule A: original logic (gr_pred only) ─────────────────────────────
+        last_actual = float(actual_yields.get(last_date, 0))
+        gr_pred_A   = pred_total / last_actual if last_actual > 0 else 1.0
+        pred_A      = _apply_rule(gr_pred_A, thresh_A)
+ 
+        # ── Rule B: Method B (gr_pred + velocity) ─────────────────────────────
+        rule_B  = apply_rule_method_b(pred_total, history_totals, thresh_B,
+                                       velocity_clip=velocity_clip)
+        pred_B  = rule_B['rec_days']
+ 
+        records.append({
+            'window':            i,
+            'last_date':         last_date.date(),
+            'test_date':         test_date.date(),
+            'actual_days':       actual_days,
+            # Rule A
+            'pred_A':            pred_A,
+            'error_A':           pred_A - actual_days,
+            'correct_A':         int(pred_A == actual_days),
+            'within1_A':         int(abs(pred_A - actual_days) <= 1),
+            # Rule B
+            'pred_B':            pred_B,
+            'error_B':           pred_B - actual_days,
+            'correct_B':         int(pred_B == actual_days),
+            'within1_B':         int(abs(pred_B - actual_days) <= 1),
+            # Diagnostics
+            'gr_pred':           round(rule_B['gr_pred'], 4),
+            'velocity_raw':      round(rule_B['velocity_raw'], 4),
+            'velocity_clipped':  round(rule_B['velocity_clipped'], 4),
+        })
+ 
+    df = pd.DataFrame(records)
+ 
+    # Print comparison table
+    print(f"\n{'='*75}")
+    print(f"  {site} — Rule A vs Rule B (Method B)  |  7x7 x Scheme B")
+    print(f"{'='*75}")
+    print(f"  {'Win':>3}  {'Test date':>12}  {'Actual':>6}  "
+          f"{'PredA':>6}  {'ErrA':>5}  {'OkA':>4}  "
+          f"{'PredB':>6}  {'ErrB':>5}  {'OkB':>4}  "
+          f"{'gr_pred':>8}  {'velocity':>9}")
+    print(f"  {'─'*73}")
+    for _, row in df.iterrows():
+        ok_a = '✓' if row['correct_A'] else ('~' if row['within1_A'] else '✗')
+        ok_b = '✓' if row['correct_B'] else ('~' if row['within1_B'] else '✗')
+        print(f"  {int(row['window']):>3}  {str(row['test_date']):>12}  "
+              f"{int(row['actual_days']):>6}  "
+              f"{int(row['pred_A']):>6}  {row['error_A']:>+5}  {ok_a:>4}  "
+              f"{int(row['pred_B']):>6}  {row['error_B']:>+5}  {ok_b:>4}  "
+              f"{row['gr_pred']:>8.4f}  {row['velocity_raw']:>+9.4f}")
+ 
+    print(f"  {'─'*73}")
+    print(f"\n  Metric summary:")
+    for label, col_c, col_w, col_e in [
+        ('Rule A', 'correct_A', 'within1_A', 'error_A'),
+        ('Rule B', 'correct_B', 'within1_B', 'error_B'),
+    ]:
+        acc  = df[col_c].mean()
+        w1   = df[col_w].mean()
+        mae  = df[col_e].abs().mean()
+        bias = df[col_e].mean()
+        print(f"  {label}:  Acc={acc:.3f}  Within-1={w1:.3f}  "
+              f"MAE={mae:.3f}d  Bias={bias:+.3f}d")
+ 
+    # Windows where A and B differ
+    diff = df[df['pred_A'] != df['pred_B']]
+    print(f"\n  Windows where A ≠ B: {len(diff)} / {len(df)}")
+    if not diff.empty:
+        print(f"  {'Win':>3}  {'Actual':>6}  {'PredA':>6}  {'PredB':>6}  "
+              f"{'velocity':>9}  {'Effect'}")
+        for _, row in diff.iterrows():
+            effect = ('B more aggressive' if row['pred_B'] < row['pred_A']
+                      else 'B more conservative')
+            print(f"  {int(row['window']):>3}  {int(row['actual_days']):>6}  "
+                  f"{int(row['pred_A']):>6}  {int(row['pred_B']):>6}  "
+                  f"{row['velocity_raw']:>+9.4f}  {effect}")
+ 
+    return df
+ 
+ 
+def plot_rule_a_vs_b(df: pd.DataFrame, site: str):
+    """
+    Side-by-side visualization of Rule A vs Rule B predictions.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle(f'{site} — Rule A vs Rule B  |  7x7 x Scheme B',
+                 fontsize=13, fontweight='bold')
+ 
+    x = np.arange(len(df))
+ 
+    # Plot 1: pred vs actual for both rules
+    ax1 = axes[0]
+    ax1.plot(x, df['actual_days'], 'o-',  color='#2d6a3f', lw=2.5, ms=8,
+             label='actual_days (farmer)', zorder=5)
+    ax1.plot(x, df['pred_A'],      's--', color='#5B8DB8', lw=2, ms=7,
+             label='Rule A (gr_pred only)', zorder=4)
+    ax1.plot(x, df['pred_B'],      '^:',  color='#E07B39', lw=2, ms=7,
+             label='Rule B (+ velocity)',   zorder=4)
+ 
+    # Highlight windows where A ≠ B
+    for xi, row in zip(x, df.itertuples()):
+        if row.pred_A != row.pred_B:
+            ax1.axvspan(xi - 0.4, xi + 0.4, alpha=0.12, color='#c0392b')
+            ax1.annotate('A≠B', (xi, max(row.pred_A, row.pred_B, row.actual_days)),
+                         textcoords='offset points', xytext=(0, 10),
+                         ha='center', fontsize=8, color='#c0392b', fontweight='bold')
+ 
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([f"{row.test_date}\n(w{row.window})"
+                          for row in df.itertuples()],
+                         rotation=20, ha='right', fontsize=8)
+    ax1.set_ylabel('Days since last harvest')
+    ax1.set_title('Predicted vs Actual\n(red shading = A and B disagree)',
+                  fontweight='bold')
+    ax1.legend(fontsize=9); ax1.grid(alpha=0.3); ax1.set_ylim(bottom=0)
+ 
+    # Plot 2: error comparison side-by-side
+    ax2 = axes[1]
+    bw  = 0.35
+    ax2.bar(x - bw/2, df['error_A'], width=bw, label='Rule A error',
+            color=['#2d6a3f' if e==0 else ('#5B8DB8' if abs(e)<=1 else '#c0392b')
+                   for e in df['error_A']],
+            edgecolor='white', linewidth=0.5)
+    ax2.bar(x + bw/2, df['error_B'], width=bw, label='Rule B error',
+            color=['#2d6a3f' if e==0 else ('#E07B39' if abs(e)<=1 else '#c0392b')
+                   for e in df['error_B']],
+            edgecolor='white', linewidth=0.5)
+    ax2.axhline(0, color='black', lw=1.5)
+    ax2.axhline(df['error_A'].mean(), color='#5B8DB8', lw=1.5, ls='--',
+                label=f"A bias={df['error_A'].mean():+.2f}d")
+    ax2.axhline(df['error_B'].mean(), color='#E07B39', lw=1.5, ls='--',
+                label=f"B bias={df['error_B'].mean():+.2f}d")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels([str(row.test_date) for row in df.itertuples()],
+                         rotation=30, ha='right', fontsize=8)
+    ax2.set_ylabel('error = pred - actual (days)')
+    ax2.set_title('Prediction Error Comparison\ngreen=exact  color=±1d  red=>±1d',
+                  fontweight='bold')
+    ax2.legend(fontsize=9); ax2.grid(axis='y', alpha=0.3)
+ 
+    plt.tight_layout()
+    plt.show()
+ 
