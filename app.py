@@ -880,7 +880,9 @@ if uploaded is not None:
 else:
     last_date = df_raw["harvest_date"].max()
     st.info(f"No CSV uploaded — demo mode (last harvest: {last_date.date()})")
-
+# Ensure site column exists (required by coarsen_grid)
+if "site" not in df_raw.columns:
+    df_raw["site"] = site
 # ── Last harvest stat cards ───────────────────────────────────────────────────
 df_last  = df_raw[df_raw["harvest_date"] == last_date]
 total_kg = df_last["weight_kg"].sum()
