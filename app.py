@@ -52,102 +52,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# # ── CSS ───────────────────────────────────────────────────────────────────────
-# st.markdown("""
-# <style>
-# @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:wght@300;400;500;600&display=swap');
-
-# html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
-# h1, h2, h3 { font-family: 'DM Serif Display', serif; }
-
-# section[data-testid="stSidebar"] { background: #0f1f14; }
-# section[data-testid="stSidebar"] * { color: #d4e8d0 !important; }
-# section[data-testid="stSidebar"] .stSelectbox label,
-# section[data-testid="stSidebar"] .stSlider label,
-# section[data-testid="stSidebar"] .stFileUploader label {
-#     color: #7fbf7f !important;
-#     font-size: 0.82rem;
-#     text-transform: uppercase;
-#     letter-spacing: 0.05em;
-# }
-
-# div[data-testid="metric-container"] {
-#     background: #f7f5f0;
-#     border: 1px solid #e0dbd0;
-#     border-radius: 10px;
-#     padding: 1rem 1.2rem;
-# }
-# div[data-testid="metric-container"] label {
-#     color: #6b6558 !important;
-#     font-size: 0.78rem !important;
-#     text-transform: uppercase;
-#     letter-spacing: 0.05em;
-# }
-# div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
-#     font-family: 'DM Serif Display', serif;
-#     font-size: 2rem !important;
-#     color: #1a2e1f !important;
-# }
-
-# .rec-card {
-#     background: linear-gradient(135deg, #1a3320 0%, #2d5a3d 100%);
-#     border-radius: 14px;
-#     padding: 1.6rem 2rem;
-#     color: white;
-#     margin-bottom: 1rem;
-# }
-# .rec-title {
-#     font-family: 'DM Serif Display', serif;
-#     font-size: 1.1rem;
-#     color: #7fbf7f;
-#     margin-bottom: 0.3rem;
-#     text-transform: uppercase;
-#     letter-spacing: 0.08em;
-# }
-# .rec-date {
-#     font-family: 'DM Serif Display', serif;
-#     font-size: 2.8rem;
-#     color: white;
-#     line-height: 1.1;
-# }
-# .rec-sub { font-size: 0.9rem; color: #a8d5a8; margin-top: 0.4rem; }
-
-# .rule-badge {
-#     display: inline-block;
-#     background: #2d6a3f;
-#     color: white;
-#     border-radius: 6px;
-#     padding: 0.2rem 0.6rem;
-#     font-size: 0.78rem;
-#     font-weight: 600;
-#     letter-spacing: 0.04em;
-#     margin-top: 0.5rem;
-# }
-# .threshold-card {
-#     background: #f0f7f0;
-#     border-left: 4px solid #2d6a3f;
-#     border-radius: 0 8px 8px 0;
-#     padding: 0.8rem 1rem;
-#     font-size: 0.88rem;
-#     color: #1a3320;
-#     margin-top: 0.8rem;
-#     font-family: monospace;
-# }
-# .info-banner {
-#     background: #f0f7ff;
-#     border-left: 4px solid #3b82f6;
-#     border-radius: 0 8px 8px 0;
-#     padding: 0.8rem 1rem;
-#     font-size: 0.88rem;
-#     color: #1e3a5f;
-#     margin-bottom: 1rem;
-# }
-# </style>
-# """, unsafe_allow_html=True)
-
-
-
-
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -156,27 +60,25 @@ st.markdown("""
 html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 h1, h2, h3 { font-family: 'DM Serif Display', serif; }
 
-/* Sidebar */
-section[data-testid="stSidebar"] { background: #3a1024; }
-section[data-testid="stSidebar"] * { color: #ffe4ef !important; }
+section[data-testid="stSidebar"] { background: #0f1f14; }
+section[data-testid="stSidebar"] * { color: #d4e8d0 !important; }
 section[data-testid="stSidebar"] .stSelectbox label,
 section[data-testid="stSidebar"] .stSlider label,
 section[data-testid="stSidebar"] .stFileUploader label {
-    color: #ff9fbd !important;
+    color: #7fbf7f !important;
     font-size: 0.82rem;
     text-transform: uppercase;
     letter-spacing: 0.05em;
 }
 
-/* Metric cards */
 div[data-testid="metric-container"] {
-    background: #fff6f8;
-    border: 1px solid #f2c6d3;
+    background: #f7f5f0;
+    border: 1px solid #e0dbd0;
     border-radius: 10px;
     padding: 1rem 1.2rem;
 }
 div[data-testid="metric-container"] label {
-    color: #8a5a68 !important;
+    color: #6b6558 !important;
     font-size: 0.78rem !important;
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -184,12 +86,11 @@ div[data-testid="metric-container"] label {
 div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
     font-family: 'DM Serif Display', serif;
     font-size: 2rem !important;
-    color: #4a1329 !important;
+    color: #1a2e1f !important;
 }
 
-/* Recommendation card */
 .rec-card {
-    background: linear-gradient(135deg, #5a1633 0%, #c44569 100%);
+    background: linear-gradient(135deg, #1a3320 0%, #2d5a3d 100%);
     border-radius: 14px;
     padding: 1.6rem 2rem;
     color: white;
@@ -198,7 +99,7 @@ div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
 .rec-title {
     font-family: 'DM Serif Display', serif;
     font-size: 1.1rem;
-    color: #ffc2d6;
+    color: #7fbf7f;
     margin-bottom: 0.3rem;
     text-transform: uppercase;
     letter-spacing: 0.08em;
@@ -209,16 +110,11 @@ div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
     color: white;
     line-height: 1.1;
 }
-.rec-sub {
-    font-size: 0.9rem;
-    color: #ffe0eb;
-    margin-top: 0.4rem;
-}
+.rec-sub { font-size: 0.9rem; color: #a8d5a8; margin-top: 0.4rem; }
 
-/* Rule badge */
 .rule-badge {
     display: inline-block;
-    background: #d6336c;
+    background: #2d6a3f;
     color: white;
     border-radius: 6px;
     padding: 0.2rem 0.6rem;
@@ -227,31 +123,32 @@ div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
     letter-spacing: 0.04em;
     margin-top: 0.5rem;
 }
-
-/* Threshold card */
 .threshold-card {
-    background: #fff0f5;
-    border-left: 4px solid #d6336c;
+    background: #f0f7f0;
+    border-left: 4px solid #2d6a3f;
     border-radius: 0 8px 8px 0;
     padding: 0.8rem 1rem;
     font-size: 0.88rem;
-    color: #4a1329;
+    color: #1a3320;
     margin-top: 0.8rem;
     font-family: monospace;
 }
-
-/* Info banner */
 .info-banner {
-    background: #fff4f7;
-    border-left: 4px solid #ff7aa2;
+    background: #f0f7ff;
+    border-left: 4px solid #3b82f6;
     border-radius: 0 8px 8px 0;
     padding: 0.8rem 1rem;
     font-size: 0.88rem;
-    color: #5a1633;
+    color: #1e3a5f;
     margin-bottom: 1rem;
 }
 </style>
 """, unsafe_allow_html=True)
+
+
+
+
+
 
 
 
