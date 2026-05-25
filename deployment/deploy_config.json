@@ -1,0 +1,22 @@
+{
+  "SantaMaria": {
+    "model_file": "model_sm_7x7.pkl",
+    "thresholds_file": "thresholds_sm.pkl",
+    "raw_data_file": "df_raw_sm.parquet",
+    "weather_file": "weather_SantaMaria.csv",
+    "coarsen_n": 7,
+    "feature_config": "A3",
+    "best_model": "LightGBM",
+    "stage2_rule": "Method B (velocity)"
+  },
+  "Salinas": {
+    "model_file": "model_sal_7x7.pkl",
+    "thresholds_file": "thresholds_sal.pkl",
+    "raw_data_file": "df_raw_sal.parquet",
+    "weather_file": "weather_Salinas.csv",
+    "coarsen_n": 7,
+    "feature_config": "A4",
+    "best_model": "LightGBM + log(y+1)",
+    "stage2_rule": "Method B (velocity)"
+  }
+}
