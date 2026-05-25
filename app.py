@@ -789,7 +789,7 @@ def build_growth_rate_fig(thresholds: dict,
                label=f"t_low  = {thresholds['t_low']:.3f}  (harvest soon)")
     ax.fill_between([0, 1], thresholds["t_low"], thresholds["t_high"],
                     alpha=0.08, color="#5B8DB8", label="Stable zone")
-    color = ("#2d6a3f" if gr_pred >= thresholds["t_high"] else
+    color = ("#f4728e" if gr_pred >= thresholds["t_high"] else
              "#c0392b" if gr_pred < thresholds["t_low"] else "#5B8DB8")
     ax.scatter([0.5], [gr_pred], s=200, color=color, zorder=5,
                label=f"gr_pred = {gr_pred:.3f}")
