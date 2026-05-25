@@ -1014,3 +1014,726 @@ def compare_rolling_versions(df_raw: pd.DataFrame,
     plt.show()
 
     return result_a, result_b
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stage 2 v3 — Method B (acceleration-aware rule)
+#
+# Key additions vs original Stage 2:
+#   derive_thresholds_v2      -- filters rare intervals (< min_count)
+#   apply_rule_method_b       -- adds velocity (acceleration) to decision
+#   run_stage2_scheme_b       -- field-level eval: pred_days vs actual_days
+#   run_grid_comparison       -- grid-level ML vs Rule-B across all schemes
+#   print_stage2_metrics      -- consistent metric reporting
+# ═══════════════════════════════════════════════════════════════════════════════
+ 
+ 
+# ── Stage 2 v3: threshold derivation (filters rare intervals) ─────────────────
+ 
+def derive_thresholds_v2(df_feat: pd.DataFrame,
+                          site: str,
+                          min_count: int = 2) -> dict:
+    """
+    Derive growth-rate thresholds for Method B from feature DataFrame.
+ 
+    Fix-1 vs original derive_thresholds():
+      Intervals appearing fewer than min_count times are filtered out before
+      computing t_low / t_high, preventing a single anomalous harvest from
+      dominating the thresholds.
+ 
+    Parameters
+    ----------
+    df_feat   : feature DataFrame (must have weight_kg and days_since_last)
+    site      : site name string
+    min_count : minimum occurrences required for an interval to be included
+ 
+    Returns
+    -------
+    dict with t_low, t_high, days_map, intervals, field_df, site
+    """
+    field = (df_feat.groupby('harvest_date')
+             .agg(total_kg=('weight_kg', 'sum'),
+                  days_interval=('days_since_last', 'first'))
+             .dropna(subset=['days_interval'])
+             .sort_values('harvest_date')
+             .reset_index())
+ 
+    field['growth_rate']   = field['total_kg'] / field['total_kg'].shift(1)
+    field                  = field.dropna(subset=['growth_rate'])
+    field['days_interval'] = field['days_interval'].astype(int)
+ 
+    counts       = field['days_interval'].value_counts()
+    valid_ivs    = sorted(counts[counts >= min_count].index.tolist())
+    filtered_out = sorted(counts[counts <  min_count].index.tolist())
+ 
+    print(f"\n[{site}] Raw interval types : {sorted(field['days_interval'].unique())}")
+    if filtered_out:
+        print(f"  Filtered (< {min_count} occurrences): {filtered_out}")
+    print(f"  Used for thresholds : {valid_ivs}")
+ 
+    fv        = field[field['days_interval'].isin(valid_ivs)]
+    intervals = valid_ivs
+    print(fv.groupby('days_interval')['growth_rate']
+          .agg(['count', 'mean', 'median']).round(3))
+ 
+    if len(intervals) >= 3:
+        t_low  = float(fv[fv['days_interval'] == intervals[0]]['growth_rate'].median())
+        t_high = float(fv[fv['days_interval'] == intervals[-1]]['growth_rate'].median())
+    elif len(intervals) == 2:
+        t_low  = float(fv['growth_rate'].quantile(0.40))
+        t_high = float(fv['growth_rate'].quantile(0.60))
+    else:
+        t_low  = float(fv['growth_rate'].quantile(0.35))
+        t_high = float(fv['growth_rate'].quantile(0.65))
+ 
+    days_map = {
+        'short':  intervals[0],
+        'medium': intervals[len(intervals) // 2] if len(intervals) >= 3 else intervals[0],
+        'long':   intervals[-1],
+    }
+    print(f"  t_low={t_low:.3f}  t_high={t_high:.3f}  days_map={days_map}")
+ 
+    return {'t_low': t_low, 't_high': t_high,
+            'days_map': days_map, 'intervals': intervals,
+            'field_df': fv, 'site': site}
+ 
+ 
+# ── Method B decision: growth rate + velocity ─────────────────────────────────
+ 
+def apply_rule_method_b(pred_total: float,
+                         history_totals: list,
+                         thresholds: dict,
+                         velocity_clip: float = 0.30) -> dict:
+    """
+    Method B decision matrix using clipped velocity (acceleration).
+ 
+    Inputs
+    ------
+    pred_total     : Stage 1 predicted total yield for next harvest
+    history_totals : [total_kg at t-3, t-2, t-1]  oldest first
+    velocity_clip  : symmetric clip bound for velocity
+ 
+    Growth rates
+    ------------
+    gr_prev  = history[-2] / history[-3]
+    gr_curr  = history[-1] / history[-2]
+    gr_pred  = pred_total  / history[-1]
+    velocity = clip(gr_curr - gr_prev, -clip, +clip)
+ 
+    Decision matrix
+    ---------------
+                      velocity >= 0       velocity < 0
+    gr_pred >= t_high    long                medium
+    gr_pred >= t_low     medium              short
+    gr_pred <  t_low     short               short
+ 
+    Returns
+    -------
+    dict with gr_prev, gr_curr, gr_pred, velocity_raw, velocity_clipped, rec_days
+    """
+    h       = history_totals
+    gr_prev = h[-2] / h[-3] if h[-3] > 0 else 1.0
+    gr_curr = h[-1] / h[-2] if h[-2] > 0 else 1.0
+    gr_pred = pred_total / h[-1] if h[-1] > 0 else 1.0
+ 
+    velocity_raw     = gr_curr - gr_prev
+    velocity_clipped = float(np.clip(velocity_raw, -velocity_clip, velocity_clip))
+ 
+    t_low, t_high = thresholds['t_low'], thresholds['t_high']
+    dm            = thresholds['days_map']
+ 
+    if gr_pred >= t_high:
+        rec_days = dm['long']   if velocity_clipped >= 0 else dm['medium']
+    elif gr_pred >= t_low:
+        rec_days = dm['medium'] if velocity_clipped >= 0 else dm['short']
+    else:
+        rec_days = dm['short']
+ 
+    return {
+        'gr_prev':          round(gr_prev, 4),
+        'gr_curr':          round(gr_curr, 4),
+        'gr_pred':          round(gr_pred, 4),
+        'velocity_raw':     round(velocity_raw, 4),
+        'velocity_clipped': round(velocity_clipped, 4),
+        'rec_days':         rec_days,
+    }
+ 
+ 
+# ── Field-level Stage 2 evaluation: pred_days vs actual_days ─────────────────
+ 
+def run_stage2_scheme_b(df_raw: pd.DataFrame,
+                         model_results_7x7,
+                         weather: pd.DataFrame,
+                         thresholds: dict,
+                         site: str,
+                         scheme_b_splits: list,
+                         velocity_clip: float = 0.30) -> pd.DataFrame:
+    """
+    Field-level Method B evaluation over Scheme B test windows.
+ 
+    For each window:
+      1. Run Stage 1 (coarsen_n=7) to get pred_total.
+      2. Apply Method B rule → rec_days.
+      3. actual_days = days_since_last for that test date (ground truth).
+      4. Compute error = rec_days - actual_days directly.
+ 
+    No yield lookup. No nearest-date matching.
+ 
+    Parameters
+    ----------
+    df_raw           : raw DataFrame from data_pipeline (1x1)
+    model_results_7x7: output of models.run_model_comparison() on 7x7 grid
+    weather          : weather DataFrame
+    thresholds       : output of derive_thresholds_v2()
+    site             : site name string
+    scheme_b_splits  : output of build_scheme_b_splits()
+    velocity_clip    : clip bound for velocity
+ 
+    Returns
+    -------
+    DataFrame with one row per window:
+      window, last_date, test_date, actual_days, pred_days,
+      error, correct, within_1, gr_pred, velocity_raw, velocity_clipped
+    """
+    actual_yields = df_raw.groupby('harvest_date')['weight_kg'].sum()
+    all_dates     = sorted(df_raw['harvest_date'].unique())
+ 
+    date_to_days = {}
+    for i in range(1, len(all_dates)):
+        gap = (pd.Timestamp(all_dates[i]) - pd.Timestamp(all_dates[i-1])).days
+        date_to_days[pd.Timestamp(all_dates[i])] = gap
+ 
+    records = []
+ 
+    for i, sp in enumerate(scheme_b_splits):
+        test_date = pd.Timestamp(sp['test_date'])
+        last_date = pd.Timestamp(sp['train_d2'])
+ 
+        actual_days = date_to_days.get(test_date)
+        if actual_days is None:
+            print(f"  Window {i}: cannot compute actual_days for {test_date}, skipping")
+            continue
+ 
+        past_dates = [d for d in all_dates if pd.Timestamp(d) <= last_date]
+        if len(past_dates) < 3:
+            print(f"  Window {i}: fewer than 3 past dates, skipping")
+            continue
+ 
+        history_totals = [float(actual_yields.get(pd.Timestamp(d), 0))
+                          for d in past_dates[-3:]]
+ 
+        try:
+            inf_df     = _build_inference_row(
+                df_raw, last_date,
+                last_date + timedelta(days=1),
+                weather, lag_depth=3, coarsen_n=7)
+            pred_total = float(_predict_yield(inf_df, model_results_7x7).sum())
+        except Exception as e:
+            print(f"  Window {i}: Stage 1 failed -> {e}")
+            continue
+ 
+        rule     = apply_rule_method_b(pred_total, history_totals, thresholds,
+                                        velocity_clip=velocity_clip)
+        rec_days = rule['rec_days']
+ 
+        records.append({
+            'window':            i,
+            'last_date':         last_date.date(),
+            'test_date':         test_date.date(),
+            'actual_days':       actual_days,
+            'pred_days':         rec_days,
+            'error':             rec_days - actual_days,
+            'correct':           int(rec_days == actual_days),
+            'within_1':          int(abs(rec_days - actual_days) <= 1),
+            'gr_pred':           rule['gr_pred'],
+            'velocity_raw':      rule['velocity_raw'],
+            'velocity_clipped':  rule['velocity_clipped'],
+        })
+ 
+    return pd.DataFrame(records)
+ 
+ 
+def print_stage2_metrics(df: pd.DataFrame, site: str):
+    """Print Accuracy, MAE, Within-1, Bias for a stage2 result DataFrame."""
+    if df.empty:
+        print(f"[{site}] No results."); return
+    acc  = df['correct'].mean()
+    mae  = df['error'].abs().mean()
+    w1   = df['within_1'].mean()
+    bias = df['error'].mean()
+    print(f"\n[{site}] Evaluation (pred_days vs actual_days):")
+    print(f"  N windows  : {len(df)}")
+    print(f"  Accuracy   : {acc:.3f}  (exact match rate)")
+    print(f"  MAE        : {mae:.3f} days")
+    print(f"  Within-1   : {w1:.3f}  (|error| <= 1 day)")
+    print(f"  Bias       : {bias:+.3f} days  (+ = recommends longer)")
+ 
+ 
+# ── Helper: build Scheme B splits ─────────────────────────────────────────────
+ 
+def build_scheme_b_splits(df_feat: pd.DataFrame,
+                           train_ratio: float = 0.6) -> tuple:
+    """
+    Build Scheme B (chronological sliding window) test splits from df_feat.
+ 
+    Returns (splits, windows, split_idx) where splits is a list of dicts
+    with keys: train_df, test_date, train_d1, train_d2.
+    """
+    dates     = sorted(df_feat['harvest_date'].unique())
+    n         = len(dates)
+    windows   = [(dates[i], dates[i+1], dates[i+2]) for i in range(n - 2)]
+    split_idx = int(len(windows) * train_ratio)
+    splits    = []
+    for d1, d2, d3 in windows[split_idx:]:
+        splits.append({
+            'train_df':  df_feat[df_feat['harvest_date'].isin([d1, d2])].copy(),
+            'test_date': d3, 'train_d1': d1, 'train_d2': d2,
+        })
+    return splits, windows, split_idx
+ 
+ 
+# ── Grid-level comparison: ML vs Rule-B across schemes and grid sizes ──────────
+ 
+def _get_scheme_dates(df_feat, scheme, site,
+                       test_ratio=0.4, train_ratio=0.6, seed=42):
+    """Return (train_dates, test_dates) per ABCDE scheme at harvest-date level."""
+    dates = sorted(df_feat['harvest_date'].unique())
+    n     = len(dates)
+    if scheme == 'A.1':
+        np.random.seed(seed)
+        test_idx  = sorted(np.random.choice(n, max(1, int(n*test_ratio)), replace=False))
+        train_idx = [i for i in range(n) if i not in test_idx]
+    elif scheme in ('B', 'C'):
+        split = int(n * train_ratio)
+        train_idx = list(range(split)); test_idx = list(range(split, n))
+    elif scheme == 'D':
+        np.random.seed(seed + 1)
+        test_idx  = sorted(np.random.choice(n, max(1, int(n*test_ratio)), replace=False))
+        train_idx = [i for i in range(n) if i not in test_idx]
+    elif scheme == 'E':
+        split = int(n * test_ratio)
+        test_idx = list(range(split)); train_idx = list(range(split, n))
+    return [dates[i] for i in train_idx], [dates[i] for i in test_idx]
+ 
+ 
+def _get_field_intervals(df_feat):
+    """Return {harvest_date -> days_since_last (int)}."""
+    return (df_feat.groupby('harvest_date')['days_since_last']
+            .first().dropna().astype(int).to_dict())
+ 
+ 
+def _snap_to_valid(pred, valid_days):
+    return min(valid_days, key=lambda d: abs(d - pred))
+ 
+ 
+def _compute_metrics(actuals, preds):
+    """Return dict with acc, mae, within1, bias, n."""
+    if not actuals:
+        return {'acc': np.nan, 'mae': np.nan, 'within1': np.nan,
+                'bias': np.nan, 'n': 0}
+    a = np.array(actuals); p = np.array(preds)
+    return {
+        'acc':     float(np.mean(a == p)),
+        'mae':     float(np.mean(np.abs(a - p))),
+        'within1': float(np.mean(np.abs(a - p) <= 1)),
+        'bias':    float(np.mean(p - a)),
+        'n':       len(a),
+    }
+ 
+ 
+def _run_ml_method_grid(df_feat, scheme, site, seed=42):
+    """
+    Train RF classifier + regressor on grid-level rows.
+    Label = days_since_last (field-level, broadcast to all cells).
+    Aggregate via majority vote per test date.
+    Returns list of {date, actual, pred_cls, pred_reg}.
+    """
+    from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+ 
+    ML_FEATS = [
+        'yield_lag1', 'yield_lag2', 'yield_lag3',
+        'rolling_mean_3', 'yield_trend', 'season_cumulative', 'day_of_year',
+        'field_x', 'field_y', 'neighbor_mean_3x3', 'neighbor_mean_5x5',
+        'temp_mean_7d', 'precip_7d', 'et0_7d',
+        'humidity_mean_7d', 'soil_moisture_0_7', 'daylight_7d',
+    ]
+    feats        = [f for f in ML_FEATS if f in df_feat.columns]
+    interval_map = _get_field_intervals(df_feat)
+    valid_days   = sorted(set(interval_map.values()))
+ 
+    train_dates, test_dates = _get_scheme_dates(df_feat, scheme, site, seed=seed)
+    train_dates = [d for d in train_dates if d in interval_map]
+    test_dates  = [d for d in test_dates  if d in interval_map]
+    if len(train_dates) < 3 or len(test_dates) < 1:
+        return []
+ 
+    train_df = df_feat[df_feat['harvest_date'].isin(train_dates)].copy()
+    test_df  = df_feat[df_feat['harvest_date'].isin(test_dates)].copy()
+    train_df['label'] = train_df['harvest_date'].map(interval_map)
+    test_df['label']  = test_df['harvest_date'].map(interval_map)
+    train_df = train_df.dropna(subset=['label'] + feats)
+    test_df  = test_df.dropna(subset=['label'] + feats)
+ 
+    X_tr = train_df[feats].values.astype(np.float32)
+    y_tr = train_df['label'].values.astype(int)
+    X_te = test_df[feats].values.astype(np.float32)
+ 
+    clf = RandomForestClassifier(n_estimators=200, max_depth=6,
+                                  random_state=seed, n_jobs=-1)
+    clf.fit(X_tr, y_tr)
+    test_df = test_df.copy()
+    test_df['pred_cls'] = clf.predict(X_te)
+ 
+    reg = RandomForestRegressor(n_estimators=200, max_depth=6,
+                                 random_state=seed, n_jobs=-1)
+    reg.fit(X_tr, y_tr.astype(float))
+    test_df['pred_reg_raw'] = reg.predict(X_te)
+    test_df['pred_reg']     = test_df['pred_reg_raw'].apply(
+        lambda p: _snap_to_valid(p, valid_days))
+ 
+    results = []
+    for date in test_dates:
+        day_df = test_df[test_df['harvest_date'] == date]
+        if day_df.empty: continue
+        results.append({
+            'date':     date,
+            'actual':   interval_map[date],
+            'pred_cls': int(day_df['pred_cls'].mode().iloc[0]),
+            'pred_reg': int(day_df['pred_reg'].mode().iloc[0]),
+        })
+    return results
+ 
+ 
+def _derive_rule_thresholds_raw(df_raw, train_dates, interval_map, min_count=2):
+    """Derive thresholds from RAW (un-normalised) field totals."""
+    field = (df_raw[df_raw['harvest_date'].isin(train_dates)]
+             .groupby('harvest_date').agg(total_kg=('weight_kg', 'sum'))
+             .reset_index().sort_values('harvest_date'))
+    field['days_interval'] = field['harvest_date'].map(interval_map)
+    field = field.dropna(subset=['days_interval'])
+    field['days_interval'] = field['days_interval'].astype(int)
+    field['growth_rate']   = field['total_kg'] / field['total_kg'].shift(1)
+    field = field.dropna(subset=['growth_rate'])
+ 
+    counts    = field['days_interval'].value_counts()
+    valid_ivs = sorted(counts[counts >= min_count].index.tolist())
+    if not valid_ivs:
+        valid_ivs = sorted(counts.index.tolist())
+ 
+    fv = field[field['days_interval'].isin(valid_ivs)]
+    intervals = valid_ivs
+ 
+    if len(intervals) >= 3:
+        t_low  = float(fv[fv['days_interval'] == intervals[0]]['growth_rate'].median())
+        t_high = float(fv[fv['days_interval'] == intervals[-1]]['growth_rate'].median())
+    elif len(intervals) == 2:
+        t_low  = float(fv['growth_rate'].quantile(0.40))
+        t_high = float(fv['growth_rate'].quantile(0.60))
+    else:
+        t_low, t_high = 0.90, 1.10
+ 
+    days_map = {
+        'short':  intervals[0],
+        'medium': intervals[len(intervals)//2] if len(intervals) >= 3 else intervals[0],
+        'long':   intervals[-1],
+    }
+    return {'t_low': t_low, 't_high': t_high, 'days_map': days_map}
+ 
+ 
+def _run_rule_method_grid(df_raw, df_feat, scheme, site,
+                           coarsen_n=1, velocity_clip=0.30, seed=42):
+    """
+    Grid-level Rule-Based Method B using RAW (un-normalised) yield.
+    Growth rates computed from df_raw weight_kg so different grid sizes
+    produce genuinely different cell-level gr_pred values.
+    Returns list of {date, actual, pred_rule}.
+    """
+    interval_map = _get_field_intervals(df_feat)
+    train_dates, test_dates = _get_scheme_dates(df_feat, scheme, site, seed=seed)
+    train_dates = [d for d in train_dates if d in interval_map]
+    test_dates  = [d for d in test_dates  if d in interval_map]
+    if len(train_dates) < 3 or len(test_dates) < 1:
+        return []
+ 
+    if coarsen_n > 1:
+        import feature_engineering as fe
+        df_raw_g = fe.coarsen_grid(df_raw, n=coarsen_n)
+    else:
+        df_raw_g = df_raw.copy()
+ 
+    thresholds = _derive_rule_thresholds_raw(df_raw_g, train_dates, interval_map)
+ 
+    raw_pivot = (df_raw_g.groupby(['harvest_date', 'field_x', 'field_y'])['weight_kg']
+                 .sum().reset_index())
+    all_dates = sorted(df_raw_g['harvest_date'].unique())
+ 
+    results = []
+    for date in test_dates:
+        actual = interval_map[date]
+        past   = [d for d in all_dates if pd.Timestamp(d) < pd.Timestamp(date)]
+        if len(past) < 3: continue
+        d_t1, d_t2, d_t3 = past[-1], past[-2], past[-3]
+ 
+        kg_t1 = (raw_pivot[raw_pivot['harvest_date']==d_t1]
+                 .set_index(['field_x','field_y'])['weight_kg'])
+        kg_t2 = (raw_pivot[raw_pivot['harvest_date']==d_t2]
+                 .set_index(['field_x','field_y'])['weight_kg'])
+        kg_t3 = (raw_pivot[raw_pivot['harvest_date']==d_t3]
+                 .set_index(['field_x','field_y'])['weight_kg'])
+ 
+        common = kg_t1.index.intersection(kg_t2.index).intersection(kg_t3.index)
+        if len(common) == 0: continue
+        kg_t1 = kg_t1.loc[common]; kg_t2 = kg_t2.loc[common]; kg_t3 = kg_t3.loc[common]
+ 
+        gr_pred  = np.where(kg_t2 > 0, kg_t1 / kg_t2, 1.0)
+        gr_prev  = np.where(kg_t3 > 0, kg_t2 / kg_t3, 1.0)
+        velocity = np.clip(gr_pred - gr_prev, -velocity_clip, velocity_clip)
+ 
+        cell_recs = []
+        for gp, v in zip(gr_pred, velocity):
+            t_low, t_high = thresholds['t_low'], thresholds['t_high']
+            dm = thresholds['days_map']
+            if gp >= t_high:
+                cell_recs.append(dm['long'] if v >= 0 else dm['medium'])
+            elif gp >= t_low:
+                cell_recs.append(dm['medium'] if v >= 0 else dm['short'])
+            else:
+                cell_recs.append(dm['short'])
+ 
+        pred_rule = int(pd.Series(cell_recs).mode().iloc[0])
+        results.append({'date': date, 'actual': actual, 'pred_rule': pred_rule})
+    return results
+ 
+ 
+def run_grid_comparison(grid_feats: dict,
+                         df_sm: pd.DataFrame,
+                         df_sal: pd.DataFrame,
+                         grid_sizes: list = None,
+                         schemes: list = None) -> pd.DataFrame:
+    """
+    Run grid-level ML vs Rule-B comparison across all grid sizes and schemes.
+ 
+    Parameters
+    ----------
+    grid_feats  : dict mapping grid label to (df_feat_sm, df_feat_sal)
+                  e.g. {'1x1': (df_feat_sm, df_feat_sal), '7x7': (...)}
+    df_sm       : raw SantaMaria DataFrame from data_pipeline
+    df_sal      : raw Salinas DataFrame from data_pipeline
+    grid_sizes  : list of keys to evaluate (default = all keys in grid_feats)
+    schemes     : list of schemes (default = ['A.1','B','C','D','E'])
+ 
+    Returns
+    -------
+    DataFrame with columns:
+      grid, site, scheme, method, acc, mae, within1, bias, n_test
+    """
+    if grid_sizes is None:
+        grid_sizes = list(grid_feats.keys())
+    if schemes is None:
+        schemes = ['A.1', 'B', 'C', 'D', 'E']
+ 
+    GRID_COARSEN = {'1x1': 1, '5x5': 5, '7x7': 7, '8x8': 8}
+ 
+    print("=" * 70)
+    print("  Grid-Level Method Comparison: ML vs Rule-B")
+    print(f"  Grid sizes : {grid_sizes}")
+    print(f"  Schemes    : {schemes}")
+    print("=" * 70)
+ 
+    all_records = []
+ 
+    for grid_size in grid_sizes:
+        if grid_size not in grid_feats:
+            print(f"\n  [{grid_size}] not in grid_feats, skipping")
+            continue
+ 
+        df_feat_sm_g, df_feat_sal_g = grid_feats[grid_size]
+        coarsen_n = GRID_COARSEN.get(grid_size, 1)
+ 
+        for site, df_feat_g, df_raw_g in [
+            ('SantaMaria', df_feat_sm_g, df_sm),
+            ('Salinas',    df_feat_sal_g, df_sal),
+        ]:
+            mask = df_feat_g['rolling_mean_3'].isna()
+            if mask.sum() > 0:
+                df_feat_g = df_feat_g.copy()
+                df_feat_g.loc[mask, 'rolling_mean_3'] = df_feat_g.loc[mask, 'yield_lag1']
+ 
+            print(f"\n  [{grid_size}] {site}")
+ 
+            for scheme in schemes:
+                # ML
+                ml_res = _run_ml_method_grid(df_feat_g, scheme, site)
+                if ml_res:
+                    actuals   = [r['actual']   for r in ml_res]
+                    preds_cls = [r['pred_cls'] for r in ml_res]
+                    preds_reg = [r['pred_reg'] for r in ml_res]
+                    for m, mname in [(_compute_metrics(actuals, preds_cls), 'ML_RF_cls'),
+                                     (_compute_metrics(actuals, preds_reg), 'ML_RF_reg')]:
+                        all_records.append({
+                            'grid': grid_size, 'site': site, 'scheme': scheme,
+                            'method': mname, **{k: m[k] for k in ['acc','mae','within1','bias','n']},
+                        })
+                    m_cls = _compute_metrics(actuals, preds_cls)
+                    m_reg = _compute_metrics(actuals, preds_reg)
+                    print(f"    {scheme}  ML_cls  acc={m_cls['acc']:.3f}  "
+                          f"mae={m_cls['mae']:.2f}d  w1={m_cls['within1']:.3f}  "
+                          f"bias={m_cls['bias']:+.2f}d  n={m_cls['n']}")
+                    print(f"    {scheme}  ML_reg  acc={m_reg['acc']:.3f}  "
+                          f"mae={m_reg['mae']:.2f}d  w1={m_reg['within1']:.3f}  "
+                          f"bias={m_reg['bias']:+.2f}d  n={m_reg['n']}")
+                else:
+                    print(f"    {scheme}  ML      insufficient data")
+ 
+                # Rule-B
+                rule_res = _run_rule_method_grid(df_raw_g, df_feat_g, scheme, site,
+                                                  coarsen_n=coarsen_n)
+                if rule_res:
+                    actuals    = [r['actual']    for r in rule_res]
+                    preds_rule = [r['pred_rule'] for r in rule_res]
+                    m_rule = _compute_metrics(actuals, preds_rule)
+                    all_records.append({
+                        'grid': grid_size, 'site': site, 'scheme': scheme,
+                        'method': 'Rule_B', **{k: m_rule[k] for k in ['acc','mae','within1','bias','n']},
+                    })
+                    print(f"    {scheme}  Rule_B  acc={m_rule['acc']:.3f}  "
+                          f"mae={m_rule['mae']:.2f}d  w1={m_rule['within1']:.3f}  "
+                          f"bias={m_rule['bias']:+.2f}d  n={m_rule['n']}")
+                else:
+                    print(f"    {scheme}  Rule_B  insufficient data")
+ 
+    results_df = pd.DataFrame(all_records)
+    results_df = results_df.rename(columns={'n': 'n_test'})
+ 
+    # Print summary tables
+    print("\n" + "=" * 70)
+    print("  SUMMARY")
+    print("=" * 70)
+    overall = (results_df.groupby(['site','method'])[['acc','mae','within1','bias']]
+               .mean().round(3))
+    print("\nOverall (mean across all grids x schemes):")
+    print(overall.to_string())
+ 
+    by_grid = (results_df.groupby(['grid','method'])[['acc','mae','within1','bias']]
+               .mean().round(3).unstack('method'))
+    print("\nBy grid size (mean across schemes x sites):")
+    print(by_grid.to_string())
+ 
+    by_scheme = (results_df.groupby(['scheme','method'])[['acc','mae','within1','bias']]
+                 .mean().round(3).unstack('method'))
+    print("\nBy scheme (mean across grids x sites):")
+    print(by_scheme.to_string())
+ 
+    return results_df
+ 
+ 
+def plot_grid_comparison(results_df: pd.DataFrame,
+                          grid_sizes: list = None,
+                          schemes: list = None):
+    """
+    Visualize grid comparison results:
+      Plot 1/2 : Accuracy by grid size, per site
+      Plot 3/4 : Accuracy by scheme, per site
+      Plot 5   : MAE heatmap (grid x method)
+      Plot 6   : Within-1 rate by method
+      Plot 7   : Bias by method x grid size
+    """
+    import matplotlib.gridspec as gs_mod
+ 
+    if grid_sizes is None:
+        grid_sizes = sorted(results_df['grid'].unique())
+    if schemes is None:
+        schemes = sorted(results_df['scheme'].unique())
+ 
+    SITES = ['SantaMaria', 'Salinas']
+    METHOD_COLORS = {
+        'ML_RF_cls': '#5B8DB8',
+        'ML_RF_reg': '#3A6186',
+        'Rule_B':    '#E07B39',
+    }
+ 
+    fig = plt.figure(figsize=(18, 18))
+    gs  = gs_mod.GridSpec(4, 2, hspace=0.45, wspace=0.35)
+ 
+    for col, site in enumerate(SITES):
+        ax = fig.add_subplot(gs[0, col])
+        sub = results_df[results_df['site'] == site]
+        gm  = sub.groupby(['grid','method'])['acc'].mean().unstack('method')
+        x   = np.arange(len(grid_sizes)); bw = 0.25
+        for k, method in enumerate(['ML_RF_cls','ML_RF_reg','Rule_B']):
+            if method in gm.columns:
+                vals = [gm.loc[g, method] if g in gm.index else np.nan for g in grid_sizes]
+                ax.bar(x + (k-1)*bw, vals, width=bw, color=METHOD_COLORS[method],
+                       label=method, edgecolor='white', linewidth=0.5)
+        ax.set_xticks(x); ax.set_xticklabels(grid_sizes)
+        ax.set_ylabel('Accuracy')
+        ax.set_title(f'{site} — Accuracy by Grid Size', fontweight='bold')
+        ax.legend(fontsize=8); ax.grid(axis='y', alpha=0.3); ax.set_ylim(0, 1.05)
+ 
+    for col, site in enumerate(SITES):
+        ax = fig.add_subplot(gs[1, col])
+        sub = results_df[results_df['site'] == site]
+        sm  = sub.groupby(['scheme','method'])['acc'].mean().unstack('method')
+        x   = np.arange(len(schemes)); bw = 0.25
+        for k, method in enumerate(['ML_RF_cls','ML_RF_reg','Rule_B']):
+            if method in sm.columns:
+                vals = [sm.loc[s, method] if s in sm.index else np.nan for s in schemes]
+                ax.bar(x + (k-1)*bw, vals, width=bw, color=METHOD_COLORS[method],
+                       label=method, edgecolor='white', linewidth=0.5)
+        ax.set_xticks(x); ax.set_xticklabels(schemes)
+        ax.set_ylabel('Accuracy')
+        ax.set_title(f'{site} — Accuracy by Scheme', fontweight='bold')
+        ax.legend(fontsize=8); ax.grid(axis='y', alpha=0.3); ax.set_ylim(0, 1.05)
+ 
+    ax5 = fig.add_subplot(gs[2, 0])
+    mae_pivot = (results_df.groupby(['grid','method'])['mae']
+                 .mean().unstack('method')
+                 .reindex(grid_sizes)[['ML_RF_cls','ML_RF_reg','Rule_B']])
+    vmax = mae_pivot.values[~np.isnan(mae_pivot.values)].max()
+    im = ax5.imshow(mae_pivot.values, cmap='RdYlGn_r', aspect='auto', vmin=0, vmax=vmax)
+    ax5.set_xticks(range(len(mae_pivot.columns)))
+    ax5.set_xticklabels(mae_pivot.columns, rotation=15, ha='right')
+    ax5.set_yticks(range(len(grid_sizes))); ax5.set_yticklabels(grid_sizes)
+    ax5.set_title('MAE Heatmap (grid x method)\ndarker = worse', fontweight='bold')
+    plt.colorbar(im, ax=ax5, label='MAE (days)')
+    for i in range(len(grid_sizes)):
+        for j in range(len(mae_pivot.columns)):
+            val = mae_pivot.values[i, j]
+            if not np.isnan(val):
+                ax5.text(j, i, f'{val:.2f}', ha='center', va='center',
+                         fontsize=9, fontweight='bold', color='white')
+ 
+    ax6 = fig.add_subplot(gs[2, 1])
+    w1  = results_df.groupby(['method','site'])['within1'].mean().unstack('site')
+    methods = w1.index.tolist(); x = np.arange(len(methods)); bw = 0.35
+    for k, site in enumerate(SITES):
+        if site in w1.columns:
+            ax6.bar(x + (k-0.5)*bw, w1[site].values, width=bw, label=site,
+                    color=['#5B8DB8','#E07B39'][k], edgecolor='white', linewidth=0.5)
+    ax6.axhline(1.0, color='#2d6a3f', ls='--', lw=1.5, label='perfect')
+    ax6.set_xticks(x); ax6.set_xticklabels(methods, rotation=15, ha='right')
+    ax6.set_ylabel('Within-1 Rate')
+    ax6.set_title('Within-1 Rate by Method', fontweight='bold')
+    ax6.legend(fontsize=8); ax6.grid(axis='y', alpha=0.3); ax6.set_ylim(0, 1.1)
+ 
+    ax7 = fig.add_subplot(gs[3, :])
+    bias_data = (results_df.groupby(['method','grid'])['bias']
+                 .mean().unstack('grid').reindex(columns=grid_sizes))
+    x = np.arange(len(bias_data.index)); bw = 0.18
+    for k, grid in enumerate(grid_sizes):
+        if grid in bias_data.columns:
+            ax7.bar(x + (k-1.5)*bw, bias_data[grid].values, width=bw,
+                    label=grid, edgecolor='white', linewidth=0.5)
+    ax7.axhline(0, color='black', lw=1.5)
+    ax7.set_xticks(x); ax7.set_xticklabels(bias_data.index, rotation=15, ha='right')
+    ax7.set_ylabel('Bias (days)  + = recommends longer')
+    ax7.set_title('Bias by Method x Grid Size', fontweight='bold')
+    ax7.legend(fontsize=8, title='Grid'); ax7.grid(axis='y', alpha=0.3)
+ 
+    fig.suptitle('Stage 2 — Grid-Level ML vs Rule-B\n'
+                 'Comparison across Grid Sizes x ABCDE Schemes',
+                 fontsize=13, fontweight='bold')
+    plt.show()
+ 
