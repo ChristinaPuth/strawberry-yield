@@ -1,0 +1,11 @@
+streamlit
+lightgbm
+pandas
+numpy
+matplotlib
+pyarrow
+scikit-learn
+xgboost
+openmeteo-requests
+requests-cache
+retry-requests
