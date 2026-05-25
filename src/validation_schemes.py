@@ -1448,7 +1448,7 @@ def plot_full_transfer(full_transfer_df, grids=None):
  
 
 
-
+ 
  # ──────────────────────────────────────────────────────────────────────────────
 # Cross-experiment average summary
 # Add this to the END of validation_schemes.py
@@ -1459,7 +1459,7 @@ def _prepare_cross_test_df(cross_df,
                            scheme_order=None,
                            test_only=True):
     """
-    Prepare cross-experiment results for summary analysis.
+    Prepare cross-experiment esults for summary analysis.
 
     Parameters
     ----------
