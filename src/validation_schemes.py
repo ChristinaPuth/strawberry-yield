@@ -1446,3 +1446,343 @@ def plot_full_transfer(full_transfer_df, grids=None):
         plt.tight_layout()
         plt.show()
  
+
+
+
+ # ──────────────────────────────────────────────────────────────────────────────
+# Cross-experiment average summary
+# Add this to the END of validation_schemes.py
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _prepare_cross_test_df(cross_df,
+                           grid_order=None,
+                           scheme_order=None,
+                           test_only=True):
+    """
+    Prepare cross-experiment results for summary analysis.
+
+    Parameters
+    ----------
+    cross_df     : output of run_cross_experiment()
+    grid_order   : optional display order for grid shapes
+    scheme_order : optional display order for schemes
+    test_only    : if True, keep only rows whose scheme contains 'test'
+
+    Returns
+    -------
+    pd.DataFrame with cleaned scheme names.
+    """
+    import pandas as pd
+
+    df = cross_df.copy()
+
+    if test_only:
+        df = df[df["scheme"].astype(str).str.contains("test")].copy()
+
+    # A.1_test -> A.1, B_test -> B
+    df["scheme_clean"] = (
+        df["scheme"]
+        .astype(str)
+        .str.replace("_test", "", regex=False)
+        .str.replace("_val", "", regex=False)
+    )
+
+    if grid_order is not None and "grid" in df.columns:
+        df["grid"] = pd.Categorical(
+            df["grid"],
+            categories=grid_order,
+            ordered=True
+        )
+
+    if scheme_order is not None:
+        df["scheme_clean"] = pd.Categorical(
+            df["scheme_clean"],
+            categories=scheme_order,
+            ordered=True
+        )
+
+    return df
+
+
+def summarize_cross_averages(cross_df,
+                              grid_order=None,
+                              scheme_order=None,
+                              metrics=None,
+                              test_only=True):
+    """
+    Compute average performance summaries for cross-experiment results.
+
+    Returns
+    -------
+    dict with:
+        overall_by_scheme : average across both sites and all grids
+        site_by_scheme    : average by site and scheme
+        grid_by_scheme    : average by grid and scheme
+    """
+    import pandas as pd
+
+    if metrics is None:
+        metrics = [
+            "cell_r2", "cell_rmse", "cell_mape",
+            "field_r2", "field_rmse", "field_mape"
+        ]
+
+    df = _prepare_cross_test_df(
+        cross_df,
+        grid_order=grid_order,
+        scheme_order=scheme_order,
+        test_only=test_only
+    )
+
+    # Only keep metrics that exist
+    metrics = [m for m in metrics if m in df.columns]
+
+    overall_by_scheme = (
+        df.groupby("scheme_clean", observed=True)[metrics]
+        .mean()
+        .round(4)
+        .reset_index()
+        .rename(columns={"scheme_clean": "scheme"})
+    )
+
+    site_by_scheme = (
+        df.groupby(["site", "scheme_clean"], observed=True)[metrics]
+        .mean()
+        .round(4)
+        .reset_index()
+        .rename(columns={"scheme_clean": "scheme"})
+    )
+
+    grid_by_scheme = (
+        df.groupby(["grid", "scheme_clean"], observed=True)[metrics]
+        .mean()
+        .round(4)
+        .reset_index()
+        .rename(columns={"scheme_clean": "scheme"})
+    )
+
+    return {
+        "overall_by_scheme": overall_by_scheme,
+        "site_by_scheme": site_by_scheme,
+        "grid_by_scheme": grid_by_scheme,
+        "prepared_df": df,
+    }
+
+
+def compare_scheme_b(cross_df,
+                     grid_order=None,
+                     scheme_order=None,
+                     group_col=None,
+                     test_only=True):
+    """
+    Compare Scheme B against A.1 and E.
+
+    Parameters
+    ----------
+    group_col : None, 'site', or 'grid'
+        None  -> overall average comparison
+        site  -> compare within each site
+        grid  -> compare within each grid shape
+
+    Returns
+    -------
+    pd.DataFrame with B improvements over A.1 and E.
+    """
+    import pandas as pd
+
+    summaries = summarize_cross_averages(
+        cross_df,
+        grid_order=grid_order,
+        scheme_order=scheme_order,
+        test_only=test_only
+    )
+
+    if group_col is None:
+        avg_df = summaries["overall_by_scheme"].copy()
+        groups = [("Overall", avg_df)]
+        output_group_col = "group"
+
+    elif group_col == "site":
+        avg_df = summaries["site_by_scheme"].copy()
+        groups = list(avg_df.groupby("site", observed=True))
+        output_group_col = "site"
+
+    elif group_col == "grid":
+        avg_df = summaries["grid_by_scheme"].copy()
+        groups = list(avg_df.groupby("grid", observed=True))
+        output_group_col = "grid"
+
+    else:
+        raise ValueError("group_col must be None, 'site', or 'grid'.")
+
+    records = []
+
+    for group_name, sub in groups:
+        sub = sub.copy()
+
+        if "scheme" not in sub.columns:
+            continue
+
+        sub = sub.set_index("scheme")
+
+        if "B" not in sub.index:
+            continue
+
+        b = sub.loc["B"]
+
+        for other in ["A.1", "E"]:
+            if other not in sub.index:
+                continue
+
+            o = sub.loc[other]
+
+            record = {
+                output_group_col: group_name,
+                "compare": f"B vs {other}",
+
+                # Higher is better
+                "cell_r2_gain": round(b["cell_r2"] - o["cell_r2"], 4),
+                "field_r2_gain": round(b["field_r2"] - o["field_r2"], 4),
+
+                # Lower is better
+                "cell_mape_reduction_abs": round(o["cell_mape"] - b["cell_mape"], 4),
+                "field_mape_reduction_abs": round(o["field_mape"] - b["field_mape"], 4),
+            }
+
+            if o["cell_mape"] != 0:
+                record["cell_mape_reduction_pct"] = round(
+                    (o["cell_mape"] - b["cell_mape"]) / o["cell_mape"] * 100, 2
+                )
+            else:
+                record["cell_mape_reduction_pct"] = None
+
+            if o["field_mape"] != 0:
+                record["field_mape_reduction_pct"] = round(
+                    (o["field_mape"] - b["field_mape"]) / o["field_mape"] * 100, 2
+                )
+            else:
+                record["field_mape_reduction_pct"] = None
+
+            records.append(record)
+
+    return pd.DataFrame(records)
+
+
+def print_cross_average_summary(cross_df,
+                                grid_order=None,
+                                scheme_order=None,
+                                test_only=True,
+                                display_tables=True):
+    """
+    Print and optionally display average cross-experiment summaries.
+
+    Returns
+    -------
+    dict containing all summary tables.
+    """
+    summaries = summarize_cross_averages(
+        cross_df,
+        grid_order=grid_order,
+        scheme_order=scheme_order,
+        test_only=test_only
+    )
+
+    overall_b_compare = compare_scheme_b(
+        cross_df,
+        grid_order=grid_order,
+        scheme_order=scheme_order,
+        group_col=None,
+        test_only=test_only
+    )
+
+    site_b_compare = compare_scheme_b(
+        cross_df,
+        grid_order=grid_order,
+        scheme_order=scheme_order,
+        group_col="site",
+        test_only=test_only
+    )
+
+    grid_b_compare = compare_scheme_b(
+        cross_df,
+        grid_order=grid_order,
+        scheme_order=scheme_order,
+        group_col="grid",
+        test_only=test_only
+    )
+
+    results = {
+        **summaries,
+        "overall_b_compare": overall_b_compare,
+        "site_b_compare": site_b_compare,
+        "grid_b_compare": grid_b_compare,
+    }
+
+    print("\n" + "=" * 90)
+    print("Average Test Performance by Scheme")
+    print("Averaged across both sites and all grid shapes")
+    print("=" * 90)
+
+    if display_tables:
+        try:
+            from IPython.display import display
+            display(results["overall_by_scheme"])
+        except Exception:
+            print(results["overall_by_scheme"].to_string(index=False))
+    else:
+        print(results["overall_by_scheme"].to_string(index=False))
+
+    print("\n" + "=" * 90)
+    print("Average Test Performance by Site and Scheme")
+    print("Averaged across all grid shapes")
+    print("=" * 90)
+
+    if display_tables:
+        try:
+            from IPython.display import display
+            display(results["site_by_scheme"])
+        except Exception:
+            print(results["site_by_scheme"].to_string(index=False))
+    else:
+        print(results["site_by_scheme"].to_string(index=False))
+
+    print("\n" + "=" * 90)
+    print("How much better is Scheme B than A.1 and E? — Overall")
+    print("=" * 90)
+
+    if display_tables:
+        try:
+            from IPython.display import display
+            display(results["overall_b_compare"])
+        except Exception:
+            print(results["overall_b_compare"].to_string(index=False))
+    else:
+        print(results["overall_b_compare"].to_string(index=False))
+
+    print("\n" + "=" * 90)
+    print("How much better is Scheme B than A.1 and E? — By Site")
+    print("=" * 90)
+
+    if display_tables:
+        try:
+            from IPython.display import display
+            display(results["site_b_compare"])
+        except Exception:
+            print(results["site_b_compare"].to_string(index=False))
+    else:
+        print(results["site_b_compare"].to_string(index=False))
+
+    return results
+
+
+def reload_validation_schemes():
+    """
+    Reload validation_schemes.py inside Colab / Jupyter.
+
+    Usage:
+        vs = reload_validation_schemes()
+    """
+    import importlib
+    import validation_schemes as vs
+    importlib.reload(vs)
+    return vs
