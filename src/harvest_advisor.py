@@ -2035,7 +2035,7 @@ def run_stage2_scheme_b_v2(df_raw, model_results_7x7, weather,
     return pd.DataFrame(records)
 
 
-# ── 실행 ──────────────────────────────────────────────────────────────────────
+
 print("=" * 65)
 print("  SantaMaria — Method B v2 (window-constrained) x 7x7 x Scheme B")
 print("=" * 65)
