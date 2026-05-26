@@ -6,304 +6,231 @@ Sites: SantaMaria (Ranch 31) · Salinas | Season: 2024
 
 ---
 
-## Project Overview
+## Overview
 
-This project builds an end-to-end pipeline that answers two core questions for strawberry farm managers:
+A two-stage machine learning pipeline that answers two core questions for strawberry farming:
 
-1. **When should I harvest?** — Given the most recent harvest data, which day in the next 3–7 days maximises total yield while minimising over-ripening risk?
-2. **What will the yield map look like?** — A spatial prediction of per-cell yield (~1.2 m resolution) for each candidate harvest day.
+1. **Stage 1 — Yield Prediction**: Given historical grid-level yield maps and weather data, predict the spatial yield distribution of the next harvest.
+2. **Stage 2 — Harvest Timing**: Given the yield prediction and recent yield trajectory, recommend the optimal number of days to wait before harvesting.
 
-The system uses only historical yield maps and publicly available weather data — no drone imagery or remote sensing required.
+The system is deployed as an interactive Streamlit web app where farmers can upload the latest harvest CSV and receive a data-driven recommendation.
 
 ---
 
-## Repository Structure
+
+
+## Project Structure
 
 ```
-Codes/
-├── app.py                          # Streamlit web application
-├── src/
-│   ├── data_pipeline.py            # Load and clean raw CSV data
-│   ├── feature_engineering.py      # Build 21 predictive features + weather fetch
-│   ├── models.py                   # Ablation study + model comparison
-│   ├── harvest_advisor.py          # Optimal harvest timing decision layer
-│   └── visualize.py                # Yield maps, season trends, distributions
+strawberry-yield/
+├── app.py                      # Streamlit web application (v4)
+├── requirements.txt            # Python dependencies for Streamlit Cloud
+│
+├── src/                        # Core pipeline modules
+│   ├── data_pipeline.py        # Data loading, weather/feature caching
+│   ├── feature_engineering.py  # Feature construction, normalisation, splits
+│   ├── models.py               # Ablation study, model comparison, evaluation
+│   ├── harvest_advisor.py      # Stage 2 rule engine + deployment API
+│   ├── validation_schemes.py   # ABCDE cross-validation schemes
+│   └── visualize.py            # Plotting utilities
+│
 ├── notebooks/
-│   ├── 02_data_visualization.ipynb # Data exploration and visualisation
-│   ├── 03_feature_engineering.ipynb# Feature construction and validation
-│   └── 04_modeling.ipynb           # Ablation, model comparison, harvest advice
-├── outputs/
-│   └── processed_data/
-│       ├── features_SantaMaria.csv # Pre-built features (351,024 rows)
-│       ├── features_Salinas.csv    # Pre-built features (205,650 rows)
-│       ├── weather_SantaMaria.csv  # Cached daily weather
-│       └── weather_Salinas.csv
-└── YieldMapHarvest_Original Data/  # Raw data (read-only, never modified)
-    ├── Santa Maria - ranch 31_corrected_YieldMap/
-    └── Salinas Harvest 2024_corrected_YieldMap/
+│   └── 04_modeling_clean.ipynb # Main experiment notebook (full pipeline)
+│
+├── deployment/                 # Pre-trained artifacts (loaded by app.py)
+│   ├── model_sm_7x7.pkl        # Stage 1 model — SantaMaria (LightGBM, A3, 7×7)
+│   ├── model_sal_7x7.pkl       # Stage 1 model — Salinas (LightGBM+log, A4, 7×7)
+│   ├── thresholds_sm.pkl       # Stage 2 Rule B thresholds — SantaMaria
+│   ├── thresholds_sal.pkl      # Stage 2 Rule B thresholds — Salinas
+│   ├── df_raw_sm.parquet       # Historical harvest data — SantaMaria
+│   ├── df_raw_sal.parquet      # Historical harvest data — Salinas
+│   ├── weather_SantaMaria.csv  # Weather data — SantaMaria
+│   ├── weather_Salinas.csv     # Weather data — Salinas
+│   └── deploy_config.json      # App configuration
+│
+└── outputs/
+    └── processed_data/         # Cached features and weather (generated locally)
 ```
 
 ---
 
-## System Architecture — Four Layers
+## Two-Stage Pipeline
 
-### Layer 1: Data Pipeline (`data_pipeline.py`)
+### Stage 1 — Yield Prediction (LightGBM)
 
-Reads all dated harvest folders, assigns column names (raw CSVs have no headers), parses dates, and merges into a single clean DataFrame.
+Predicts `weight_kg` for every grid cell at the next harvest.
 
-**Input:** Raw CSV folders  
-`{date}/{date}_yield.csv` — columns: index, field_x, field_y, weight_kg, easting, northing
+**Input features (per grid cell):**
 
-**Output:** Clean DataFrame with columns:
-`site | harvest_date | harvest_idx | field_x | field_y | weight_kg | easting | northing`
-
-Key design decisions:
-- **Harvest-event indexing**: each harvest is numbered 1, 2, 3… in chronological order. This index is used for all lag features and train/val/test splits.
-- **UTM outlier filtering**: a small number of rows have corrupt GPS coordinates (~3, 4) and are removed.
-- No data is ever written back to the original data folders.
-
----
-
-### Layer 2: Feature Engineering (`feature_engineering.py`)
-
-Constructs 21 predictive features across three groups.
-
-#### Temporal features (8)
-| Feature | Description |
-|---|---|
-| `yield_lag1` | Yield at the immediately preceding harvest |
-| `yield_lag2` | Yield two harvests back |
-| `yield_lag3` | Yield three harvests back |
-| `rolling_mean_3` | Mean of lag1/2/3 — smooths noise |
-| `yield_trend` | (lag1 - lag3) / 2 — directional momentum |
-| `season_cumulative` | Running sum of all past yields for this cell |
-| `days_since_last` | Calendar days between the last two harvests |
-| `day_of_year` | Day of year — encodes phenological season position |
-
-> **Why harvest-event lags, not fixed calendar lags?**  
-> Strawberry harvest intervals vary from 3 to 7 days. "7 days ago" is meaningless when the interval is 3 days — the slot is simply empty. Harvest-event lags always refer to the immediately preceding harvest event, and `days_since_last` separately encodes how many calendar days elapsed. The model learns that a 3-day gap produces less regrowth than a 7-day gap.
-
-#### Spatial features (4)
-| Feature | Description |
-|---|---|
-| `field_x` | Grid column index |
-| `field_y` | Grid row index |
-| `neighbor_mean_3x3` | Mean yield of the 3×3 neighbourhood at lag1 |
-| `neighbor_mean_5x5` | Mean yield of the 5×5 neighbourhood at lag1 |
-
-Neighbourhood features capture the strong row-level spatial autocorrelation visible in the yield maps (vertical stripe patterns). Edge cells use only available neighbours — no zero-padding.
-
-#### Weather features (9)
-All aggregated over the 7 calendar days immediately before each harvest date (the harvest day itself is excluded to prevent data leakage). Fetched from the Open-Meteo historical archive API.
-
-| Feature | Variable | Aggregation |
+| Group | Features | Count |
 |---|---|---|
-| `temp_mean_7d` | Air temperature 2m | 7-day mean |
-| `temp_max_7d` | Max temperature | 7-day max |
-| `temp_min_7d` | Min temperature | 7-day min |
-| `precip_7d` | Precipitation | 7-day sum |
-| `et0_7d` | Reference evapotranspiration | 7-day sum |
-| `humidity_mean_7d` | Relative humidity | 7-day mean |
-| `soil_moisture_0_7` | Soil moisture 0–7 cm | 7-day mean |
-| `soil_moisture_7_28` | Soil moisture 7–28 cm | 7-day mean |
-| `daylight_7d` | Daylight duration | 7-day mean (hours) |
+| Temporal | `yield_lag1/2/3`, `rolling_mean_3`, `yield_trend`, `season_cumulative`, `day_of_year` | 7 |
+| Spatial | `field_x`, `field_y`, `neighbor_mean_3x3`, `neighbor_mean_5x5` | 4 |
+| Weather | `temp_mean/max/min_7d`, `precip_7d`, `et0_7d`, `humidity_mean_7d`, `soil_moisture_0_7/7_28`, `daylight_7d` | 9 |
 
-> **Why field-level uniform weather?**  
-> Each field is under 200 m wide, while Open-Meteo data has ~1 km resolution. All cells within a field share identical weather values on any given day. Spatial variation in yield is explained by spatial features, not weather.
+**Best configurations (from Ablation Study):**
 
-**Train / Val / Test split** (strictly chronological — random shuffle is never used):
-
-| Site | Train | Validation | Test |
+| Site | Feature Set | Model | Val R² |
 |---|---|---|---|
-| SantaMaria | Harvests 1–20 (Apr 10 – Jun 14) | 21–23 (Jun 18–28) | 24–27 (Jul 2–16) |
-| Salinas | Harvests 1–15 (Jun 3 – Jul 29) | 16–18 (Jul 30 – Aug 6) | 19–21 (Aug 10–19) |
+| SantaMaria | A3 — Spatial only (4 features) | LightGBM | 0.913 |
+| Salinas | A4 — Spatio-temporal (11 features) | LightGBM + log(y+1) | 0.735 |
+
+**Grid resolution:** 7×7 super-cells (aggregated from original 1×1 cells)
 
 ---
 
-### Layer 3: Prediction Model (`models.py`)
+### Stage 2 — Harvest Timing (Method B, Rule-Based)
 
-#### Ablation study (8 configurations)
-Before model selection, a systematic ablation identifies which feature groups contribute predictive signal. All configurations use default-parameter LightGBM.
+Recommends how many days to wait before the next harvest using a growth-rate rule with velocity correction.
 
-| Config | Features | SantaMaria val R² | Salinas val R² |
-|---|---|---|---|
-| A0 | yield_lag1 only | -0.04 | -1.93 |
-| A1 | Temporal yield (5) | -0.18 | -0.61 |
-| A2 | Full temporal (8) | 0.17 | 0.01 |
-| A3 | Spatial only (4) | **0.68** | 0.54 |
-| A4 | Spatio-temporal (12) | 0.66 | **0.55** |
-| A5 | A4 + 3 core weather | 0.65 | 0.55 |
-| A6 | A4 + all weather | 0.65 | 0.55 |
-| A7 | All 21 features | 0.65 | 0.55 |
+**Growth rates:**
+```
+gr_prev  = yield(t-2) / yield(t-3)   ← momentum of previous interval
+gr_curr  = yield(t-1) / yield(t-2)   ← most recent momentum
+gr_pred  = predicted_yield / yield(t-1)  ← Stage 1 prediction vs last actual
+velocity = clip(gr_curr - gr_prev, -0.3, +0.3)  ← acceleration
+```
 
-**Key findings:**
-- Spatial features dominate — field position alone explains ~68% of yield variance in SantaMaria.
-- Adding weather features does not improve performance (consistent with prior work). The 7-day weather window is too coarse to add signal beyond what spatial and temporal features already encode.
-- A4 (spatio-temporal, no weather) is used as the operational feature set because it includes time-series information needed for seasonal tracking.
+**Decision matrix:**
 
-#### Model comparison (on A4 feature set)
-
-| Model | SantaMaria val R² | Salinas val R² |
+|  | velocity ≥ 0 (accelerating) | velocity < 0 (decelerating) |
 |---|---|---|
-| Linear Regression | -2.44 | -0.22 |
-| Random Forest | 0.65 | 0.52 |
-| LightGBM | 0.65 | 0.55 |
-| XGBoost | 0.66 | 0.55 |
-| LightGBM + log(y+1) | **0.67** | **0.55** |
+| `gr_pred ≥ t_high` | wait **long** | wait **medium** |
+| `gr_pred ≥ t_low` | wait **medium** | wait **short** |
+| `gr_pred < t_low` | wait **short** | wait **short** |
 
-LightGBM with log(y+1) target transform is selected. The log transform addresses the highly right-skewed yield distribution (63.9% zero cells in SantaMaria) and reduces systematic underestimation of high-yield cells.
+Thresholds (`t_low`, `t_high`) are derived from the training data distribution of harvest intervals.
 
 ---
 
-### Layer 4: Harvest Advisor (`harvest_advisor.py`)
+## Experiment Design
 
-Given the most recent actual harvest, predicts yield for each candidate harvest day (default: +3 to +7 days) and recommends the optimal timing.
+### Validation Schemes (ABCDE)
 
-**Algorithm:**
-1. For each candidate day `t+k`:
-   - Build inference features using the 3 most recent actual harvests as lag1/2/3
-   - Fetch 7-day weather ending the day before `t+k`
-   - Compute neighbourhood means from lag1
-   - Run the trained model → predicted yield per cell
-   - Apply over-ripening penalty to cells that have been consistently high-yield
-2. Compare adjusted total yield across all candidate days
-3. Return the day with the highest adjusted yield as the recommendation
+Five cross-validation schemes to evaluate model robustness across different temporal scenarios:
 
-**Over-ripening penalty:**  
-Cells with `yield_lag1 > 75th percentile` are flagged as at risk. Their predicted yield is reduced by `penalty_weight × lag1` to discourage waiting too long. Default penalty weight = 0.05.
+| Scheme | Description | Test set |
+|---|---|---|
+| A.1 | Random window selection | Random 40% |
+| B | Chronological sliding window (2 train + 1 predict) | Last 40% |
+| C | Expanding window | Last 40% |
+| D | Random split (different seed) | Random 40% |
+| E | Early-season test | First 40% |
 
----
+### Grid Sizes Evaluated
 
-## Data Summary
+`1×1`, `5×5`, `7×7`, `8×8` super-cells
 
-| Site | Harvests | Grid cells/harvest | Total rows | Season total | Peak harvest | Avg % zero cells |
-|---|---|---|---|---|---|---|
-| SantaMaria | 27 (Apr 10 – Jul 16) | 14,626 | 394,902 | 101,454 kg | May 29 (8,345 kg) | 63.9% |
-| Salinas | 21 (Jun 3 – Aug 19) | 11,425 | 239,925 | 46,854 kg | Jun 24 (4,575 kg) | 24.1% |
+### Cross-Site Transfer
 
-> **Salinas anomaly:** The Jul 29 / Jul 30 pair has only a 1-day interval (operationally unusual). These rows are flagged with `is_anomaly=1` and should be examined separately in residual analysis.
+Train on SantaMaria → evaluate on Salinas (and vice versa) to test spatial generalisation of features across farms.
 
----
+--
 
-## Running the App
+## Running Locally
 
-### Prerequisites
-
-Python 3.9+ with a virtual environment:
+### 1. Clone and set up environment
 
 ```bash
-cd "path/to/Codes"
-python3 -m venv venv
-source venv/bin/activate
-pip install streamlit lightgbm xgboost openmeteo-requests requests-cache \
-    retry-requests matplotlib pandas numpy scikit-learn
+git clone https://github.com/ChristinaPuth/strawberry-yield.git
+cd strawberry-yield
+python -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-### Start the app
+### 2. Run the app
 
 ```bash
-source venv/bin/activate
-python -m streamlit run app.py
+streamlit run app.py
 ```
 
-Browser opens at `http://localhost:8501`.
+The app loads pre-trained models from `deployment/` — no training required.
 
-### Using the app
+### 3. Using the app
 
 1. Select **Site** (SantaMaria or Salinas) in the sidebar
-2. Set **Forecast window** (default: +3 to +7 days)
-3. Upload the latest harvest CSV (`{date}_yield.csv`)
-4. Set the **Harvest date** of the uploaded file
-5. Click **Run Analysis**
-
-The app outputs:
-- Stat cards: total yield, active cells, mean yield per cell, % zero cells
-- Recommendation card: optimal harvest date + expected yield
-- Predicted yield map for the optimal day
-- Forecast bar chart comparing all candidate days
-- All candidate day yield maps
+2. Upload the latest harvest CSV (format: `field_x, field_y, weight_kg, easting, northing`)
+3. Set the **harvest date** of the uploaded file
+4. Click **Run Analysis**
+5. View the recommendation, predicted yield map, and historical timeline
 
 ---
 
-## Running in Google Colab
+## Reproducing the Experiments
 
-All notebooks are designed to run in Colab with Google Drive mounted.
+Open `notebooks/04_modeling_clean.ipynb` in Google Colab or Kaggle.
 
-**Standard setup cell (add to top of every notebook):**
+The notebook is organised into sections:
 
-```python
-from google.colab import drive
-drive.mount('/content/drive')
-
-import sys
-sys.path.insert(0, '/content/drive/MyDrive/Spatio-Temporal Modeling of '
-                   'Grid-Level Crop Yield Using Weather and Historical '
-                   'Yield Data/Codes/src')
-
-BASE = ('/content/drive/MyDrive/Spatio-Temporal Modeling of '
-        'Grid-Level Crop Yield Using Weather and Historical '
-        'Yield Data/Codes/YieldMapHarvest_Original Data')
-
-OUTPUTS = ('/content/drive/MyDrive/Spatio-Temporal Modeling of '
-           'Grid-Level Crop Yield Using Weather and Historical '
-           'Yield Data/Codes/outputs/processed_data')
-```
-
-**Reload modules after editing src files:**
-
-```python
-import importlib, data_pipeline, feature_engineering as fe, models as m
-importlib.reload(data_pipeline)
-importlib.reload(fe)
-importlib.reload(m)
-```
-
----
-
-## Notebook Guide
-
-| Notebook | Purpose |
+| Section | Content |
 |---|---|
-| `02_data_visualization.ipynb` | Load raw data, plot yield maps, season trends, distributions. Confirms data quality. |
-| `03_feature_engineering.ipynb` | Fetch weather, build 21 features, save to `processed_data/`. Run once — results are cached. |
-| `04_modeling.ipynb` | Ablation study (8 configs), model comparison (5 models), harvest advisor demo. |
+| 0 — Setup | Install packages, mount Drive, import modules |
+| 1 — Data Loading | Load raw harvest CSVs, fetch weather |
+| 2 — Baseline Model | Feature engineering, ablation study, model comparison, test evaluation |
+| 2.5 — Grid Scan | Compare 1×1 to 8×8 grid sizes on the original split |
+| 3 — Cross Experiment | ABCDE × all grid sizes |
+| 4 — Transfer | Cross-site generalisation |
+| Stage 2 | Method B evaluation, ML vs Rule-B comparison |
+| Deployment | Save artifacts to `deployment/` |
 
 ---
 
-## Key Design Decisions
+## Generating Deployment Artifacts
 
-| Decision | Choice | Reason |
-|---|---|---|
-| Lag type | Harvest-event lags | Irregular intervals (3–7 days) make calendar-day lags meaningless |
-| Data split | Strictly chronological | Random split leaks future yield into training set |
-| Weather granularity | Field-level uniform | Field < 200 m, weather data at ~1 km resolution |
-| Prediction target | Next harvest event (t+1) | Only harvest days have yield labels; calendar dates do not |
-| days_since_last | Explicit input feature | Model learns regrowth as a function of elapsed time |
-| Spatial position | field_x, field_y (not UTM) | Grid indices are sufficient; UTM adds no predictive value |
-| Target transform | log(y+1) | Addresses extreme right skew (median 0.54 kg vs mean 0.71 kg) |
+After running the full notebook, execute the **Save for Deployment** cell at the end. It reads pre-trained models and thresholds from memory and saves them to `outputs/deployment/`.
+
+Prerequisites in memory: `df_sm`, `df_sal`, `weather_sm`, `weather_sal`, `df_feat_sm_7x7`, `df_feat_sal_7x7`, `model_results_sm_7x7`, `model_results_sal_7x7`, `thresholds_sm_7x7`, `thresholds_sal_7x7`.
 
 ---
 
-## Open Questions
+## Data Format
 
-- **lag1 availability**: Does the farm enter harvest data the same evening, or the next morning? If same evening: lag1 (today's yield) is available as a feature (+R² ~0.05–0.10). If next morning: only lag2 onward can be used. Both scenarios can be supported.
-- **days_since_last at inference**: Is this provided by the farmer (planned harvest date), or should the system use the historical mean (~4 days)?
-- **Salinas Jul 29/30 anomaly**: Data entry error or true double-harvest event? Affects whether these samples are kept, dropped, or flagged only.
-- **Confidence intervals**: Point estimates only, or also quantile regression intervals for uncertainty quantification?
+Each harvest CSV file has no header and the following columns:
+
+```
+field_x, field_y, weight_kg, easting, northing
+```
+
+Or with an index column as the first column:
+
+```
+index, field_x, field_y, weight_kg, easting, northing
+```
+
+Raw data is not included in this repository. Contact the authors for access.
 
 ---
 
 ## Dependencies
 
 ```
-pandas >= 1.3
-numpy >= 1.21
-scikit-learn >= 1.0
-lightgbm >= 3.3
-xgboost >= 1.6
-matplotlib >= 3.5
-streamlit >= 1.20
+streamlit
+lightgbm
+pandas
+numpy
+matplotlib
+pyarrow
+scikit-learn
+xgboost
 openmeteo-requests
 requests-cache
 retry-requests
 ```
+
+---
+
+## Citation
+
+If you use this work, please cite:
+
+```
+Zhang, T. (2024). Spatio-Temporal Modeling of Grid-Level Crop Yield
+Using Weather and Historical Yield Data. UC Davis.
+```
+
+---
+
+## License
+
+For academic and research use only. Contact the authors for commercial licensing.
