@@ -2034,30 +2034,3 @@ def run_stage2_scheme_b_v2(df_raw, model_results_7x7, weather,
 
     return pd.DataFrame(records)
 
-
-
-print("=" * 65)
-print("  SantaMaria — Method B v2 (window-constrained) x 7x7 x Scheme B")
-print("=" * 65)
-res_sm_v2 = run_stage2_scheme_b_v2(
-    df_raw=df_sm, model_results_7x7=model_results_sm_7x7,
-    weather=weather_sm, thresholds=thresholds_sm_7x7,
-    site='SantaMaria', scheme_b_splits=splits_B_sm,
-)
-print(res_sm_v2[['window','last_date','test_date','actual_days','pred_days',
-                  'error','correct','within_1','gr_pred',
-                  'velocity_raw','velocity_clipped']].to_string(index=False))
-ha.print_stage2_metrics(res_sm_v2, 'SantaMaria')
-
-print("\n" + "=" * 65)
-print("  Salinas — Method B v2 (window-constrained) x 7x7 x Scheme B")
-print("=" * 65)
-res_sal_v2 = run_stage2_scheme_b_v2(
-    df_raw=df_sal, model_results_7x7=model_results_sal_7x7,
-    weather=weather_sal, thresholds=thresholds_sal_7x7,
-    site='Salinas', scheme_b_splits=splits_B_sal,
-)
-print(res_sal_v2[['window','last_date','test_date','actual_days','pred_days',
-                   'error','correct','within_1','gr_pred',
-                   'velocity_raw','velocity_clipped']].to_string(index=False))
-ha.print_stage2_metrics(res_sal_v2, 'Salinas')
