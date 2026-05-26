@@ -1963,3 +1963,101 @@ def plot_rule_a_vs_b(df: pd.DataFrame, site: str):
     plt.tight_layout()
     plt.show()
  
+
+
+ # ── run_stage2_scheme_b  ────────────────────────
+
+
+def run_stage2_scheme_b_v2(df_raw, model_results_7x7, weather,
+                            thresholds, site, scheme_b_splits,
+                            velocity_clip=0.30):
+    """
+    Method B evaluation — strictly window-constrained.
+
+    history_totals = [yield(d1), yield(d2), pred_total]
+    Only uses the 2 training harvests visible in each Scheme B window.
+    """
+    actual_yields = df_raw.groupby('harvest_date')['weight_kg'].sum()
+    all_dates     = sorted(df_raw['harvest_date'].unique())
+
+    date_to_days = {}
+    for i in range(1, len(all_dates)):
+        gap = (pd.Timestamp(all_dates[i]) - pd.Timestamp(all_dates[i-1])).days
+        date_to_days[pd.Timestamp(all_dates[i])] = gap
+
+    records = []
+
+    for i, sp in enumerate(scheme_b_splits):
+        test_date = pd.Timestamp(sp['test_date'])
+        last_date = pd.Timestamp(sp['train_d2'])   # t-1
+        d1        = pd.Timestamp(sp['train_d1'])   # t-2
+
+        actual_days = date_to_days.get(test_date)
+        if actual_days is None:
+            continue
+
+        # ★ 핵심 변경: 윈도우 내 d1, d2만 사용 (t-3 불필요)
+        yield_d1 = float(actual_yields.get(d1,        0))  # t-2
+        yield_d2 = float(actual_yields.get(last_date, 0))  # t-1
+
+        try:
+            inf_df     = _build_inference_row(
+                df_raw, last_date,
+                last_date + timedelta(days=1),
+                weather, lag_depth=3, coarsen_n=7)
+            pred_total = float(_predict_yield(inf_df, model_results_7x7).sum())
+        except Exception as e:
+            print(f"  Window {i}: Stage 1 failed -> {e}")
+            continue
+
+        # history = [t-2, t-1, pred] — 3개
+        history_totals = [yield_d1, yield_d2, pred_total]
+
+        rule     = ha.apply_rule_method_b(pred_total, history_totals,
+                                           thresholds,
+                                           velocity_clip=velocity_clip)
+        rec_days = rule['rec_days']
+
+        records.append({
+            'window':           i,
+            'last_date':        last_date.date(),
+            'test_date':        test_date.date(),
+            'actual_days':      actual_days,
+            'pred_days':        rec_days,
+            'error':            rec_days - actual_days,
+            'correct':          int(rec_days == actual_days),
+            'within_1':         int(abs(rec_days - actual_days) <= 1),
+            'gr_pred':          rule['gr_pred'],
+            'velocity_raw':     rule['velocity_raw'],
+            'velocity_clipped': rule['velocity_clipped'],
+        })
+
+    return pd.DataFrame(records)
+
+
+# ── 실행 ──────────────────────────────────────────────────────────────────────
+print("=" * 65)
+print("  SantaMaria — Method B v2 (window-constrained) x 7x7 x Scheme B")
+print("=" * 65)
+res_sm_v2 = run_stage2_scheme_b_v2(
+    df_raw=df_sm, model_results_7x7=model_results_sm_7x7,
+    weather=weather_sm, thresholds=thresholds_sm_7x7,
+    site='SantaMaria', scheme_b_splits=splits_B_sm,
+)
+print(res_sm_v2[['window','last_date','test_date','actual_days','pred_days',
+                  'error','correct','within_1','gr_pred',
+                  'velocity_raw','velocity_clipped']].to_string(index=False))
+ha.print_stage2_metrics(res_sm_v2, 'SantaMaria')
+
+print("\n" + "=" * 65)
+print("  Salinas — Method B v2 (window-constrained) x 7x7 x Scheme B")
+print("=" * 65)
+res_sal_v2 = run_stage2_scheme_b_v2(
+    df_raw=df_sal, model_results_7x7=model_results_sal_7x7,
+    weather=weather_sal, thresholds=thresholds_sal_7x7,
+    site='Salinas', scheme_b_splits=splits_B_sal,
+)
+print(res_sal_v2[['window','last_date','test_date','actual_days','pred_days',
+                   'error','correct','within_1','gr_pred',
+                   'velocity_raw','velocity_clipped']].to_string(index=False))
+ha.print_stage2_metrics(res_sal_v2, 'Salinas')
