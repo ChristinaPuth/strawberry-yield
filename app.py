@@ -8,7 +8,7 @@ Strawberry Yield Harvest Advisor — Streamlit app.
 
 Key changes from v3:
   - Loads pre-trained models from deployment/ folder (no training at runtime)
-  - Stage 2 uses Rule B (Method B with velocity), not Rule A
+  - Stage 2 uses Rule B (Method B with Growth_Trend), not Rule A
   - coarsen_n=7 fixed to match training grid
   - Raw harvest data loaded from parquet (real kg, not feature-normalised values)
   - Yield maps and total yield shown in real kg
@@ -151,7 +151,6 @@ div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
 
 
 
-
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _HERE       = os.path.dirname(os.path.abspath(__file__))
 _DEPLOY_DIR = os.path.join(_HERE, "deployment")
@@ -272,7 +271,7 @@ def build_predicted_map_fig(advice: dict, opt_days: int) -> plt.Figure:
 
 def build_growth_rate_fig(thresholds: dict,
                            gr_pred: float,
-                           velocity: float,
+                           Growth_Trend: float,
                            opt_days: int) -> plt.Figure:
     """Single-point growth rate chart for Method B."""
     fig, ax = plt.subplots(figsize=(6, 3))
@@ -286,7 +285,7 @@ def build_growth_rate_fig(thresholds: dict,
              "#c0392b" if gr_pred < thresholds["t_low"] else "#5B8DB8")
     ax.scatter([0.5], [gr_pred], s=200, color=color, zorder=5,
                label=f"gr_pred = {gr_pred:.3f}")
-    ax.annotate(f"gr = {gr_pred:.3f}\nvelocity = {velocity:+.3f}\n→ wait {opt_days}d",
+    ax.annotate(f"gr = {gr_pred:.3f}\nGrowth_Trend = {Growth_Trend:+.3f}\n→ wait {opt_days}d",
                 (0.5, gr_pred), textcoords="offset points", xytext=(20, 8),
                 fontsize=9, color=color, fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
@@ -402,7 +401,7 @@ with st.spinner("Running Stage 1 prediction and Stage 2 rule..."):
     pred       = _predict_yield(inf_df, model_results)
     pred_total = float(pred.sum())
 
-    # Stage 1 history totals for velocity calculation
+    # Stage 1 history totals for Growth_Trend calculation
     all_dates      = sorted(df_raw["harvest_date"].unique())
     past_dates     = [d for d in all_dates if pd.Timestamp(d) <= last_date]
     actual_yields  = df_raw.groupby("harvest_date")["weight_kg"].sum()
@@ -419,7 +418,7 @@ with st.spinner("Running Stage 1 prediction and Stage 2 rule..."):
     opt_days = rule['rec_days']
     opt_date = last_date + timedelta(days=opt_days)
     gr_pred  = rule['gr_pred']
-    velocity = rule['velocity_raw']
+    Growth_Trend = rule['Growth_Trend_raw']
 
 # ── Recommendation card ───────────────────────────────────────────────────────
 st.markdown("---")
@@ -429,7 +428,7 @@ with col_left:
     trend = ("rising 📈" if gr_pred >= thresholds['t_high'] else
              "declining 📉" if gr_pred < thresholds['t_low'] else
              "stable ➡")
-    velocity_sign = "+" if velocity >= 0 else ""
+    Growth_Trend_sign = "+" if Growth_Trend >= 0 else ""
 
     st.markdown(f"""
     <div class="rec-card">
@@ -439,9 +438,9 @@ with col_left:
             +{opt_days} days from last harvest ({last_date.date()})<br>
             Expected yield: <strong>{pred_total:,.0f} kg</strong><br>
             Growth rate: <strong>{gr_pred:.3f}</strong> — {trend}<br>
-            Velocity: <strong>{velocity_sign}{velocity:.3f}</strong>
+            Growth_Trend: <strong>{Growth_Trend_sign}{Growth_Trend:.3f}</strong>
         </div>
-        <div class="rule-badge">Stage 2: Method B (velocity-aware)</div>
+        <div class="rule-badge">Stage 2: Method B (Growth_Trend-aware)</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -450,12 +449,12 @@ with col_left:
         Stage 2 thresholds (Rule B from full training data)<br>
         t_high = {thresholds['t_high']:.3f} → wait {thresholds['days_map']['long']}d<br>
         t_low  = {thresholds['t_low']:.3f} → wait {thresholds['days_map']['short']}d<br>
-        gr_pred = {gr_pred:.3f}  |  velocity = {velocity_sign}{velocity:.3f}
+        gr_pred = {gr_pred:.3f}  |  Growth_Trend = {Growth_Trend_sign}{Growth_Trend:.3f}
     </div>
     """, unsafe_allow_html=True)
 
     # Growth rate chart
-    st.pyplot(build_growth_rate_fig(thresholds, gr_pred, velocity, opt_days),
+    st.pyplot(build_growth_rate_fig(thresholds, gr_pred, Growth_Trend, opt_days),
               use_container_width=True)
 
 with col_right:
@@ -490,7 +489,7 @@ detail = pd.DataFrame([{
     "Days to wait":      opt_days,
     "Predicted yield (kg)": f"{pred_total:,.0f}",
     "Growth rate (gr_pred)": f"{gr_pred:.4f}",
-    "Velocity (raw)":    f"{velocity:+.4f}",
+    "Growth_Trend (raw)":    f"{Growth_Trend:+.4f}",
     "Trend":             trend,
     "t_low":             f"{thresholds['t_low']:.3f}",
     "t_high":            f"{thresholds['t_high']:.3f}",
