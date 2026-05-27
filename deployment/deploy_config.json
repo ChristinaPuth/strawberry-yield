@@ -7,7 +7,7 @@
     "coarsen_n": 7,
     "feature_config": "A3",
     "best_model": "LightGBM",
-    "stage2_rule": "Method B (velocity)"
+    "stage2_rule": "Method B (Growth_Trend)"
   },
   "Salinas": {
     "model_file": "model_sal_7x7.pkl",
@@ -17,6 +17,6 @@
     "coarsen_n": 7,
     "feature_config": "A4",
     "best_model": "LightGBM + log(y+1)",
-    "stage2_rule": "Method B (velocity)"
+    "stage2_rule": "Method B (Growth_Trend)"
   }
 }
